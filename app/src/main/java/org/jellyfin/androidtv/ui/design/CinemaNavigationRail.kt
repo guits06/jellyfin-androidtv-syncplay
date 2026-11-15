@@ -1,13 +1,10 @@
 package org.jellyfin.androidtv.ui.design
 
 import androidx.activity.compose.LocalActivity
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.spring
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusGroup
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,19 +33,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.tv.material3.Border
-import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Icon
 import androidx.tv.material3.MaterialTheme
-import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import org.jellyfin.androidtv.R
 import org.jellyfin.androidtv.auth.repository.SessionRepository
@@ -109,8 +105,7 @@ fun CinemaNavigationRail(
 			Box(
 				modifier = Modifier
 					.size(30.dp)
-					.clip(RoundedCornerShape(9.dp))
-					.background(palette.accentPrimary),
+					.background(palette.accentPrimary, RoundedCornerShape(9.dp)),
 				contentAlignment = Alignment.Center,
 			) {
 				Text(
@@ -212,25 +207,39 @@ private fun RailItem(
 ) {
 	val palette = CinemaTheme.palette
 	var isFocused by remember { mutableStateOf(false) }
+	val interactionSource = remember { MutableInteractionSource() }
 
-	Surface(
-		onClick = onClick,
-		scale = ClickableSurfaceDefaults.scale(focusedScale = 1.03f, pressedScale = 0.98f),
-		shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(14.dp)),
-		colors = ClickableSurfaceDefaults.colors(
-			containerColor = if (selected) palette.surfaceElevated else Color.Transparent,
-			focusedContainerColor = palette.textPrimary,
-			contentColor = if (selected) palette.textPrimary else palette.textSecondary,
-			focusedContentColor = palette.canvas,
-		),
-		border = ClickableSurfaceDefaults.border(
-			border = Border.None,
-			focusedBorder = Border(BorderStroke(2.dp, palette.accentPrimary)),
-		),
+	Box(
 		modifier = Modifier
 			.fillMaxWidth()
 			.height(46.dp)
-			.onFocusChanged { isFocused = it.isFocused },
+			.drawBehind {
+				val corner = 14.dp.toPx()
+				val bg = when {
+					isFocused -> palette.textPrimary
+					selected -> palette.surfaceElevated
+					else -> Color.Transparent
+				}
+				if (bg != Color.Transparent) {
+					drawRoundRect(
+						color = bg,
+						cornerRadius = CornerRadius(corner, corner),
+					)
+				}
+				if (isFocused) {
+					drawRoundRect(
+						color = palette.accentPrimary,
+						cornerRadius = CornerRadius(corner, corner),
+						style = Stroke(width = 2.dp.toPx()),
+					)
+				}
+			}
+			.onFocusChanged { isFocused = it.isFocused }
+			.clickable(
+				interactionSource = interactionSource,
+				indication = null,
+				onClick = onClick,
+			),
 	) {
 		Row(
 			verticalAlignment = Alignment.CenterVertically,
@@ -256,8 +265,7 @@ private fun RailItem(
 						modifier = Modifier
 							.align(Alignment.TopEnd)
 							.size(7.dp)
-							.clip(CircleShape)
-							.background(indicatorDot)
+							.background(indicatorDot, CircleShape)
 					)
 				}
 			}
@@ -266,6 +274,7 @@ private fun RailItem(
 				Text(
 					text = label,
 					style = MaterialTheme.typography.titleMedium,
+					color = if (isFocused) palette.canvas else if (selected) palette.textPrimary else palette.textSecondary,
 					maxLines = 1,
 					overflow = TextOverflow.Ellipsis,
 				)

@@ -40,8 +40,10 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
@@ -52,6 +54,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
@@ -65,6 +68,7 @@ import coil3.request.allowRgb565
 import coil3.request.crossfade
 import kotlinx.coroutines.launch
 import org.jellyfin.androidtv.util.AmbientPalette
+import org.jellyfin.androidtv.util.CineFastNative
 import org.jellyfin.sdk.model.api.GroupStateType
 import java.util.Locale
 
@@ -81,6 +85,7 @@ fun CinemaAsyncImage(
 	targetHeightDp: Dp = 135.dp,
 	crossfadeMs: Int = 0,
 	fallbackColor: Color = CinemaTheme.palette.surfaceElevated,
+	clipShape: Shape? = null,
 ) {
 	val context = LocalContext.current
 	val density = LocalDensity.current
@@ -98,47 +103,93 @@ fun CinemaAsyncImage(
 			.build()
 	}
 
-	Box(modifier = modifier.background(fallbackColor)) {
+	Box(modifier = if (clipShape != null) modifier.background(fallbackColor, clipShape) else modifier.background(fallbackColor)) {
 		if (!url.isNullOrBlank()) {
 			AsyncImage(
 				model = request,
 				contentDescription = contentDescription,
 				contentScale = contentScale,
-				modifier = Modifier.fillMaxSize(),
+				modifier = if (clipShape != null) Modifier.fillMaxSize().clip(clipShape) else Modifier.fillMaxSize(),
 			)
 		}
 	}
 }
 
 /**
- * Zero-invalidation ambient background tinted cleanly using native C color extraction (libcinefast.so):
- * swaps settled ambient colors smoothly using two cached static draws without per-frame Shader rebuilding.
+ * Single-pass opaque ambient canvas rendered by C NDK (libcinefast.so) into a cached 96x54 texture
+ * and sampled via BlendMode.Src, avoiding multi-pass 1080p radial fragment shaders on Mali-G31.
  */
 @Composable
 fun CinemaAmbientCanvas(
 	ambient: AmbientPalette,
 	modifier: Modifier = Modifier,
 ) {
-	val palette = CinemaTheme.palette
+	val canvasColor = CinemaTheme.palette.canvas
+	val texture = remember(canvasColor, ambient) {
+		CineFastNative.getAmbientTexture(canvasColor, ambient)
+	}
 
 	Box(
-		modifier = modifier
-			.background(palette.canvas)
-			.drawWithCache {
-				val base = ambient.surfaceTint
-				val radial = Brush.radialGradient(
-					colors = listOf(
-						ambient.accentTint.copy(alpha = 0.68f),
-						base.copy(alpha = 0.42f),
-						Color.Transparent,
-					),
+		modifier = modifier.drawWithCache {
+			val dstSize = IntSize(size.width.toInt().coerceAtLeast(1), size.height.toInt().coerceAtLeast(1))
+			val fallbackBrush = if (texture == null) {
+				Brush.radialGradient(
+					colors = listOf(ambient.accentTint.copy(alpha = 0.6f), canvasColor),
 					center = Offset(size.width * 0.78f, size.height * 0.18f),
 					radius = size.width * 0.75f,
 				)
-				onDrawBehind {
-					drawRect(radial)
+			} else {
+				null
+			}
+			onDrawBehind {
+				if (texture != null) {
+					drawImage(
+						image = texture,
+						dstSize = dstSize,
+						blendMode = BlendMode.Src,
+					)
+				} else {
+					drawRect(canvasColor)
+					fallbackBrush?.let { drawRect(it) }
 				}
 			}
+		}
+	)
+}
+
+/**
+ * Single-pass Hero backdrop scrim rendered by C NDK into a 64x36 premultiplied ARGB texture,
+ * replacing three stacked full-bleed linear gradients on modest TV GPUs.
+ */
+@Composable
+fun CinemaHeroScrim(
+	dimmed: Boolean = false,
+	modifier: Modifier = Modifier,
+) {
+	val canvasColor = CinemaTheme.palette.canvas
+	val scrimTex = remember(canvasColor, dimmed) {
+		CineFastNative.getHeroScrimTexture(canvasColor, dimmed)
+	}
+
+	Box(
+		modifier = modifier.drawWithCache {
+			val dstSize = IntSize(size.width.toInt().coerceAtLeast(1), size.height.toInt().coerceAtLeast(1))
+			val fallbackHoriz = if (scrimTex == null) {
+				Brush.horizontalGradient(0f to canvasColor, 0.72f to Color.Transparent)
+			} else {
+				null
+			}
+			onDrawBehind {
+				if (scrimTex != null) {
+					drawImage(
+						image = scrimTex,
+						dstSize = dstSize,
+					)
+				} else {
+					fallbackHoriz?.let { drawRect(it) }
+				}
+			}
+		}
 	)
 }
 
@@ -184,8 +235,7 @@ fun CinemaMediaCard(
 			modifier = Modifier
 				.width(cardWidth)
 				.height(cardHeight)
-				.clip(CardShape)
-				.background(palette.surfaceElevated)
+				.background(palette.surfaceElevated, CardShape)
 				.onFocusChanged { state ->
 					val nowFocused = state.isFocused
 					if (nowFocused) onFocused?.invoke()
@@ -218,6 +268,7 @@ fun CinemaMediaCard(
 				contentDescription = title,
 				targetWidthDp = cardWidth,
 				targetHeightDp = cardHeight,
+				clipShape = CardShape,
 				modifier = Modifier.fillMaxSize(),
 			)
 
@@ -285,8 +336,7 @@ private fun BoxScope.CardOverlayBadges(
 			modifier = Modifier
 				.align(Alignment.TopStart)
 				.padding(7.dp)
-				.clip(RoundedCornerShape(6.dp))
-				.background(Color(0xCC0A0A0F))
+				.background(Color(0xCC0A0A0F), RoundedCornerShape(6.dp))
 				.padding(horizontal = 7.dp, vertical = 3.dp)
 		) {
 			Text(
@@ -302,8 +352,7 @@ private fun BoxScope.CardOverlayBadges(
 			modifier = Modifier
 				.align(Alignment.TopStart)
 				.padding(7.dp)
-				.clip(RoundedCornerShape(6.dp))
-				.background(Color(0xCC0A0A0F))
+				.background(Color(0xCC0A0A0F), RoundedCornerShape(6.dp))
 				.padding(horizontal = 6.dp, vertical = 2.dp)
 		) {
 			Icon(
@@ -325,8 +374,7 @@ private fun BoxScope.CardOverlayBadges(
 			modifier = Modifier
 				.align(Alignment.TopEnd)
 				.padding(7.dp)
-				.clip(PillShape)
-				.background(palette.accentPrimary)
+				.background(palette.accentPrimary, PillShape)
 				.padding(horizontal = 8.dp, vertical = 2.dp)
 		) {
 			Text(
@@ -341,8 +389,7 @@ private fun BoxScope.CardOverlayBadges(
 				.align(Alignment.TopEnd)
 				.padding(7.dp)
 				.size(21.dp)
-				.clip(CircleShape)
-				.background(palette.accentSecondary),
+				.background(palette.accentSecondary, CircleShape),
 			contentAlignment = Alignment.Center,
 		) {
 			Icon(
@@ -391,13 +438,16 @@ fun CinemaActionButton(
 				scaleX = scale
 				scaleY = scale
 			}
-			.clip(PillShape)
 			.drawBehind {
 				val p = focusAnim.value
-				drawRect(lerp(baseContainer, focusedContainer, p))
+				val r = size.height / 2f
+				drawRoundRect(
+					color = lerp(baseContainer, focusedContainer, p),
+					cornerRadius = CornerRadius(r, r),
+				)
 				drawRoundRect(
 					color = lerp(subtleColor, ringColor, p),
-					cornerRadius = CornerRadius(size.height / 2f, size.height / 2f),
+					cornerRadius = CornerRadius(r, r),
 					style = Stroke(width = (1.dp + 1.8.dp * p).toPx()),
 				)
 			}
@@ -463,13 +513,16 @@ fun CinemaFilterChip(
 				scaleX = scale
 				scaleY = scale
 			}
-			.clip(PillShape)
 			.drawBehind {
 				val p = focusAnim.value
-				drawRect(lerp(unfocusedBg, focusedBg, p))
+				val r = size.height / 2f
+				drawRoundRect(
+					color = lerp(unfocusedBg, focusedBg, p),
+					cornerRadius = CornerRadius(r, r),
+				)
 				drawRoundRect(
 					color = lerp(unfocusedBorder, focusRing, p),
-					cornerRadius = CornerRadius(size.height / 2f, size.height / 2f),
+					cornerRadius = CornerRadius(r, r),
 					style = Stroke(width = (1.dp + 1.2.dp * p).toPx()),
 				)
 			}
@@ -587,8 +640,7 @@ fun <T> CinemaSectionRow(
 				modifier = Modifier
 					.width(4.dp)
 					.height(18.dp)
-					.clip(PillShape)
-					.background(palette.accentPrimary)
+					.background(palette.accentPrimary, PillShape)
 			)
 			Text(
 				text = title,

@@ -76,6 +76,7 @@ import org.jellyfin.androidtv.ui.design.CinemaActionButton
 import org.jellyfin.androidtv.ui.design.CinemaAmbientCanvas
 import org.jellyfin.androidtv.ui.design.CinemaAsyncImage
 import org.jellyfin.androidtv.ui.design.CinemaFilterChip
+import org.jellyfin.androidtv.ui.design.CinemaHeroScrim
 import org.jellyfin.androidtv.ui.design.CinemaMediaCard
 import org.jellyfin.androidtv.ui.design.CinemaNavDestination
 import org.jellyfin.androidtv.ui.design.CinemaNavigationRail
@@ -180,31 +181,13 @@ fun MediaDetailScreen(
 					contentScale = ContentScale.Crop,
 					targetWidthDp = 520.dp,
 					targetHeightDp = 292.dp,
-					crossfadeMs = 150,
+					crossfadeMs = 0,
 					fallbackColor = palette.canvas,
 					modifier = Modifier.fillMaxSize(),
 				)
-				Box(
-					modifier = Modifier
-						.fillMaxSize()
-						.drawWithCache {
-							val horizontal = Brush.horizontalGradient(
-								0.0f to palette.canvas,
-								0.32f to palette.canvas.copy(alpha = 0.86f),
-								0.70f to palette.canvas.copy(alpha = 0.28f),
-								1.0f to Color.Transparent,
-							)
-							val vertical = Brush.verticalGradient(
-								0.0f to palette.canvas.copy(alpha = 0.20f),
-								0.52f to Color.Transparent,
-								0.86f to palette.canvas.copy(alpha = 0.90f),
-								1.0f to palette.canvas,
-							)
-							onDrawWithContent {
-								drawRect(horizontal)
-								drawRect(vertical)
-							}
-						}
+				CinemaHeroScrim(
+					dimmed = false,
+					modifier = Modifier.fillMaxSize(),
 				)
 			}
 		}

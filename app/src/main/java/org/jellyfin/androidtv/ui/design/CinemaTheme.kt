@@ -44,12 +44,12 @@ val LocalCinemaPalette = staticCompositionLocalOf { CinemaPalette() }
 
 object CinemaMotion {
 	val FocusSpring: AnimationSpec<Float> = spring(
-		dampingRatio = 0.72f,
-		stiffness = Spring.StiffnessMediumLow,
+		dampingRatio = 0.86f,
+		stiffness = 1200f,
 	)
 	val PillSpring: AnimationSpec<Float> = spring(
-		dampingRatio = 0.78f,
-		stiffness = Spring.StiffnessMedium,
+		dampingRatio = 0.88f,
+		stiffness = 1400f,
 	)
 }
 

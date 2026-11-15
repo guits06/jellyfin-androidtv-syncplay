@@ -220,3 +220,137 @@ Java_org_jellyfin_androidtv_util_CineFastNative_nativeBlurArgb8888InPlace(
     AndroidBitmap_unlockPixels(env, bitmap);
     return JNI_TRUE;
 }
+
+static inline uint32_t pack_rgba8888_premul(uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+    if (a == 0u) return 0u;
+    if (a >= 255u) {
+        return 0xFF000000u | (clamp_u8((int32_t)b) << 16) | (clamp_u8((int32_t)g) << 8) | clamp_u8((int32_t)r);
+    }
+    uint32_t pr = (r * a + 127u) / 255u;
+    uint32_t pg = (g * a + 127u) / 255u;
+    uint32_t pb = (b * a + 127u) / 255u;
+    return (a << 24) | (pb << 16) | (pg << 8) | pr;
+}
+
+// Renders a tiny (e.g. 96x54) pre-composited opaque ambient gradient texture on CPU in ~0.04ms,
+// eliminating full-screen 1080p radial-gradient fragment shaders on Mali-G31 per animation frame.
+JNIEXPORT jboolean JNICALL
+Java_org_jellyfin_androidtv_util_CineFastNative_nativeRenderAmbientCanvas(
+    JNIEnv* env,
+    jclass clazz,
+    jobject bitmap,
+    jint canvas_argb,
+    jint surface_argb,
+    jint accent_argb
+) {
+    (void)clazz;
+    if (bitmap == NULL) return JNI_FALSE;
+
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return JNI_FALSE;
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width < 2u || info.height < 2u) return JNI_FALSE;
+
+    void* pixels = NULL;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == NULL) return JNI_FALSE;
+
+    const float cr = (float)((canvas_argb >> 16) & 0xFFu);
+    const float cg = (float)((canvas_argb >> 8) & 0xFFu);
+    const float cb = (float)(canvas_argb & 0xFFu);
+
+    const float sr = (float)((surface_argb >> 16) & 0xFFu);
+    const float sg = (float)((surface_argb >> 8) & 0xFFu);
+    const float sb = (float)(surface_argb & 0xFFu);
+
+    const float ar = (float)((accent_argb >> 16) & 0xFFu);
+    const float ag = (float)((accent_argb >> 8) & 0xFFu);
+    const float ab = (float)(accent_argb & 0xFFu);
+
+    const float inv_w = 1.0f / (float)info.width;
+    const float inv_h = 1.0f / (float)info.height;
+    const float aspect = (float)info.width * inv_h;
+
+    for (uint32_t y = 0; y < info.height; ++y) {
+        uint32_t* row = (uint32_t*)((uint8_t*)pixels + (size_t)y * info.stride);
+        float dy = ((float)y + 0.5f) * inv_h - 0.18f;
+        for (uint32_t x = 0; x < info.width; ++x) {
+            float dx = (((float)x + 0.5f) * inv_w - 0.78f) * (aspect / 1.777f);
+            float d2 = (dx * dx + dy * dy) * 1.45f;
+            float t = d2 >= 1.0f ? 0.0f : (1.0f - d2);
+            t = t * t; // smooth falloff without sqrtf
+
+            // Mix canvas -> surface -> accent
+            float w_acc = 0.58f * t * t;
+            float w_surf = 0.38f * t * (1.0f - 0.4f * t);
+            float w_canv = 1.0f - w_acc - w_surf;
+
+            uint32_t r = clamp_u8((int32_t)(cr * w_canv + sr * w_surf + ar * w_acc + 0.5f));
+            uint32_t g = clamp_u8((int32_t)(cg * w_canv + sg * w_surf + ag * w_acc + 0.5f));
+            uint32_t b = clamp_u8((int32_t)(cb * w_canv + sb * w_surf + ab * w_acc + 0.5f));
+            row[x] = 0xFF000000u | (b << 16) | (g << 8) | r;
+        }
+    }
+
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return JNI_TRUE;
+}
+
+// Pre-bakes horizontal + vertical + optional dim scrim into one tiny 64x36 premultiplied ARGB_8888 texture.
+JNIEXPORT jboolean JNICALL
+Java_org_jellyfin_androidtv_util_CineFastNative_nativeRenderHeroScrim(
+    JNIEnv* env,
+    jclass clazz,
+    jobject bitmap,
+    jint canvas_argb,
+    jboolean dimmed
+) {
+    (void)clazz;
+    if (bitmap == NULL) return JNI_FALSE;
+
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return JNI_FALSE;
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width < 2u || info.height < 2u) return JNI_FALSE;
+
+    void* pixels = NULL;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || pixels == NULL) return JNI_FALSE;
+
+    const uint32_t cr = (uint32_t)((canvas_argb >> 16) & 0xFFu);
+    const uint32_t cg = (uint32_t)((canvas_argb >> 8) & 0xFFu);
+    const uint32_t cb = (uint32_t)(canvas_argb & 0xFFu);
+
+    const float base_dim = dimmed ? 0.70f : 0.08f;
+    const float inv_w = 1.0f / (float)(info.width - 1u);
+    const float inv_h = 1.0f / (float)(info.height - 1u);
+
+    for (uint32_t y = 0; y < info.height; ++y) {
+        uint32_t* row = (uint32_t*)((uint8_t*)pixels + (size_t)y * info.stride);
+        float ny = (float)y * inv_h;
+        float av = 0.0f;
+        if (ny < 0.25f) {
+            float u = 1.0f - (ny / 0.25f);
+            av = 0.20f * u * u;
+        } else if (ny > 0.56f) {
+            float u = (ny - 0.56f) / 0.44f;
+            if (u > 1.0f) u = 1.0f;
+            av = u * u * (3.0f - 2.0f * u);
+        }
+
+        for (uint32_t x = 0; x < info.width; ++x) {
+            float nx = (float)x * inv_w;
+            float ah = 0.0f;
+            if (nx < 0.72f) {
+                float u = 1.0f - (nx / 0.72f);
+                ah = u * u * (3.0f - 2.0f * u);
+            }
+            // Porter-Duff SrcOver alpha combination of dim + ah + av
+            float one_minus = (1.0f - base_dim) * (1.0f - ah) * (1.0f - av);
+            float alpha = 1.0f - one_minus;
+            if (alpha < 0.0f) alpha = 0.0f;
+            if (alpha > 1.0f) alpha = 1.0f;
+            uint32_t a8 = (uint32_t)(alpha * 255.0f + 0.5f);
+            row[x] = pack_rgba8888_premul(cr, cg, cb, a8);
+        }
+    }
+
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return JNI_TRUE;
+}

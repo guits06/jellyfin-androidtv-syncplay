@@ -9,6 +9,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import coil3.SingletonImageLoader
 import coil3.request.ImageRequest
@@ -43,6 +46,44 @@ object CineFastNative {
 	}.getOrDefault(false)
 
 	private val paletteCache = LruCache<String, AmbientPalette>(128)
+	private val ambientTextureCache = LruCache<String, ImageBitmap>(16)
+	private val scrimTextureCache = LruCache<String, ImageBitmap>(4)
+
+	fun getAmbientTexture(
+		canvasColor: Color,
+		ambient: AmbientPalette,
+	): ImageBitmap? {
+		if (!loaded) return null
+		val cArgb = canvasColor.toArgb()
+		val sArgb = ambient.surfaceTint.toArgb()
+		val aArgb = ambient.accentTint.toArgb()
+		val key = "${cArgb}_${sArgb}_${aArgb}"
+		ambientTextureCache.get(key)?.let { return it }
+		val bmp = Bitmap.createBitmap(96, 54, Bitmap.Config.ARGB_8888)
+		return if (nativeRenderAmbientCanvas(bmp, cArgb, sArgb, aArgb)) {
+			bmp.asImageBitmap().also { ambientTextureCache.put(key, it) }
+		} else {
+			bmp.recycle()
+			null
+		}
+	}
+
+	fun getHeroScrimTexture(
+		canvasColor: Color,
+		dimmed: Boolean,
+	): ImageBitmap? {
+		if (!loaded) return null
+		val cArgb = canvasColor.toArgb()
+		val key = "${cArgb}_${dimmed}"
+		scrimTextureCache.get(key)?.let { return it }
+		val bmp = Bitmap.createBitmap(64, 36, Bitmap.Config.ARGB_8888)
+		return if (nativeRenderHeroScrim(bmp, cArgb, dimmed)) {
+			bmp.asImageBitmap().also { scrimTextureCache.put(key, it) }
+		} else {
+			bmp.recycle()
+			null
+		}
+	}
 
 	fun getCachedAmbient(key: String?): AmbientPalette? = key?.let { paletteCache.get(it) }
 
@@ -77,6 +118,21 @@ object CineFastNative {
 
 	@JvmStatic
 	private external fun nativeBlurArgb8888InPlace(bitmap: Bitmap, radius: Int): Boolean
+
+	@JvmStatic
+	private external fun nativeRenderAmbientCanvas(
+		bitmap: Bitmap,
+		canvasArgb: Int,
+		surfaceArgb: Int,
+		accentArgb: Int,
+	): Boolean
+
+	@JvmStatic
+	private external fun nativeRenderHeroScrim(
+		bitmap: Bitmap,
+		canvasArgb: Int,
+		dimmed: Boolean,
+	): Boolean
 }
 
 /**

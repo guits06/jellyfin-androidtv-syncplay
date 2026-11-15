@@ -62,6 +62,7 @@ import org.jellyfin.androidtv.syncplay.SyncPlayManager
 import org.jellyfin.androidtv.ui.design.CinemaActionButton
 import org.jellyfin.androidtv.ui.design.CinemaAmbientCanvas
 import org.jellyfin.androidtv.ui.design.CinemaAsyncImage
+import org.jellyfin.androidtv.ui.design.CinemaHeroScrim
 import org.jellyfin.androidtv.ui.design.CinemaMediaCard
 import org.jellyfin.androidtv.ui.design.CinemaNavDestination
 import org.jellyfin.androidtv.ui.design.CinemaNavigationRail
@@ -275,35 +276,15 @@ private fun HeroBackdropLayer(
 			contentScale = ContentScale.Crop,
 			targetWidthDp = 480.dp,
 			targetHeightDp = 270.dp,
-			crossfadeMs = 150,
+			crossfadeMs = 0,
 			fallbackColor = palette.canvas,
 			modifier = Modifier.fillMaxSize(),
 		)
 
-		// Single cached GPU gradient scrim (plus optional dim tint, avoiding offscreen saveLayer alpha)
-		Box(
-			modifier = Modifier
-				.fillMaxSize()
-				.drawWithCache {
-					val horizontal = Brush.horizontalGradient(
-						0.0f to palette.canvas,
-						0.28f to palette.canvas.copy(alpha = 0.85f),
-						0.66f to palette.canvas.copy(alpha = 0.28f),
-						1.0f to Color.Transparent,
-					)
-					val vertical = Brush.verticalGradient(
-						0.0f to palette.canvas.copy(alpha = 0.18f),
-						0.58f to Color.Transparent,
-						0.88f to palette.canvas.copy(alpha = 0.88f),
-						1.0f to palette.canvas,
-					)
-					val dimScrim = palette.canvas.copy(alpha = if (dimmed) 0.72f else 0.08f)
-					onDrawWithContent {
-						drawRect(dimScrim)
-						drawRect(horizontal)
-						drawRect(vertical)
-					}
-				}
+		// Single-pass C-rendered scrim texture over hero backdrop (avoids 3 gradient shaders)
+		CinemaHeroScrim(
+			dimmed = dimmed,
+			modifier = Modifier.fillMaxSize(),
 		)
 	}
 }
@@ -437,8 +418,7 @@ private fun MetaBadge(text: String) {
 	val palette = CinemaTheme.palette
 	Box(
 		modifier = Modifier
-			.clip(RoundedCornerShape(8.dp))
-			.background(Color(0x991E1E2A))
+			.background(Color(0x991E1E2A), RoundedCornerShape(8.dp))
 			.padding(horizontal = 9.dp, vertical = 4.dp),
 	) {
 		Text(
