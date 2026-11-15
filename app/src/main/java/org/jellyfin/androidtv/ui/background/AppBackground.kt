@@ -17,15 +17,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.colorResource
-import androidx.compose.ui.unit.dp
 import androidx.core.graphics.drawable.toBitmap
 import org.jellyfin.androidtv.R
 import org.jellyfin.androidtv.data.service.BackgroundService
@@ -77,6 +77,8 @@ fun AppBackground() {
 			label = "BackgroundTransition",
 		) { background ->
 			if (background != null) {
+				// Avoid expensive RenderEffect blur passes on low-end TV hardware; use cached gradient scrims instead.
+				val scrimAlpha = if (blurBackground) 0.78f else 0.45f
 				Image(
 					bitmap = background,
 					contentDescription = null,
@@ -85,7 +87,18 @@ fun AppBackground() {
 					colorFilter = ColorFilter.tint(colorResource(R.color.background_filter), BlendMode.SrcAtop),
 					modifier = Modifier
 						.fillMaxSize()
-						.then(if (blurBackground) Modifier.blur(10.dp) else Modifier)
+						.drawWithCache {
+							val verticalScrim = Brush.verticalGradient(
+								colors = listOf(
+									Color(0xFF0A0A0F).copy(alpha = scrimAlpha * 0.65f),
+									Color(0xFF0A0A0F).copy(alpha = scrimAlpha),
+								)
+							)
+							onDrawWithContent {
+								drawContent()
+								drawRect(verticalScrim)
+							}
+						}
 				)
 			} else {
 				AppThemeBackground()

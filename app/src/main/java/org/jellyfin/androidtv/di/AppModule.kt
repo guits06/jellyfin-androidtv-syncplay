@@ -4,13 +4,17 @@ import android.content.Context
 import androidx.lifecycle.ProcessLifecycleOwner
 import coil3.ImageLoader
 import coil3.annotation.ExperimentalCoilApi
+import coil3.disk.DiskCache
 import coil3.gif.AnimatedImageDecoder
 import coil3.gif.GifDecoder
+import coil3.memory.MemoryCache
 import coil3.network.NetworkFetcher
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
+import coil3.request.allowRgb565
 import coil3.serviceLoaderEnabled
 import coil3.svg.SvgDecoder
 import coil3.util.Logger
+import okio.Path.Companion.toOkioPath
 import org.jellyfin.androidtv.BuildConfig
 import org.jellyfin.androidtv.auth.repository.ServerRepository
 import org.jellyfin.androidtv.auth.repository.UserRepository
@@ -29,6 +33,7 @@ import org.jellyfin.androidtv.data.repository.UserViewsRepositoryImpl
 import org.jellyfin.androidtv.data.service.BackgroundService
 import org.jellyfin.androidtv.integration.dream.DreamViewModel
 import org.jellyfin.androidtv.ui.InteractionTrackerViewModel
+import org.jellyfin.androidtv.ui.home.HomeViewModel
 import org.jellyfin.androidtv.ui.itemhandling.ItemLauncher
 import org.jellyfin.androidtv.ui.navigation.Destinations
 import org.jellyfin.androidtv.ui.navigation.NavigationRepository
@@ -122,8 +127,21 @@ val appModule = module {
 	}
 
 	single {
-		ImageLoader.Builder(androidContext()).apply {
+		val context = androidContext()
+		ImageLoader.Builder(context).apply {
 			serviceLoaderEnabled(false)
+			allowRgb565(true)
+			memoryCache {
+				MemoryCache.Builder()
+					.maxSizePercent(context, 0.12)
+					.build()
+			}
+			diskCache {
+				DiskCache.Builder()
+					.directory(context.cacheDir.resolve("coil_cache").toOkioPath())
+					.maxSizeBytes(96L * 1024L * 1024L)
+					.build()
+			}
 			logger(CoilTimberLogger(if (BuildConfig.DEBUG) Logger.Level.Warn else Logger.Level.Error))
 
 			components {
@@ -168,6 +186,7 @@ val appModule = module {
 	viewModel { DreamViewModel(get(), get(), get(), get(), get()) }
 	viewModel { SettingsViewModel() }
 	viewModel { SettingsLibrariesScreenViewModel(get()) }
+	viewModel { HomeViewModel(androidContext(), get(), get(), get(), get(), get()) }
 
 	single { BackgroundService(get(), get(), get(), get(), get()) }
 

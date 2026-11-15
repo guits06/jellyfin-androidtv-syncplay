@@ -17,6 +17,7 @@ android {
 		applicationId = namespace
 		versionName = project.getVersionName()
 		versionCode = getVersionCode(versionName!!)
+		testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 	}
 
 	buildFeatures {
@@ -186,5 +187,8 @@ dependencies {
 	// Testing
 	testImplementation(libs.kotest.runner.junit5)
 	testImplementation(libs.kotest.assertions)
+	testImplementation(libs.kotlinx.coroutines.test)
 	testImplementation(libs.mockk)
+	androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+	debugImplementation(libs.androidx.compose.ui.test.manifest)
 }
