@@ -710,4 +710,20 @@
     <string name="tv_provider_enabled_description">Mostrar canales y recomendaciones de Jellyfin en la pantalla de inicio de Android TV</string>
     <string name="tv_provider_enabled">Integrar con Android TV Home</string>
     <string name="lbl_3d">3D</string>
+    <string name="syncplay_title">SyncPlay</string>
+    <string name="syncplay_description">Reproducción sincronizada con otros usuarios de Jellyfin</string>
+    <string name="syncplay_create_group">Crear grupo</string>
+    <string name="syncplay_group_name">Nombre del grupo</string>
+    <string name="syncplay_join_group">Unirse al grupo</string>
+    <string name="syncplay_leave_group">Salir del grupo</string>
+    <string name="syncplay_no_groups">No se encontraron grupos de SyncPlay activos</string>
+    <string name="syncplay_in_group">En grupo: %1$s</string>
+    <string name="syncplay_participants">Participantes (%1$d): %2$s</string>
+    <string name="syncplay_group_joined">Te has unido al grupo %1$s</string>
+    <string name="syncplay_group_left">Has salido del grupo de SyncPlay</string>
+    <string name="syncplay_waiting_for_members">Esperando a los miembros del grupo…</string>
+    <string name="syncplay_error_join">Error al unirse al grupo de SyncPlay</string>
+    <string name="syncplay_error_create">Error al crear el grupo de SyncPlay</string>
+    <string name="syncplay_members_count">%1$d miembros</string>
+    <string name="syncplay_indicator_format">SyncPlay: %1$s (%2$d)</string>
 </resources>

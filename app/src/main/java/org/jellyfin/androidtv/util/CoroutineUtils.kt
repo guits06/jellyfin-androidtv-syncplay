@@ -27,3 +27,13 @@ fun readCustomMessagesOnLifecycle(
 		.onEach { if (it != null) listener(it) }
 		.launchIn(lifecycle.coroutineScope)
 }
+
+fun <T> observeFlowOnLifecycle(
+	lifecycle: Lifecycle,
+	flow: kotlinx.coroutines.flow.Flow<T>,
+	listener: (item: T) -> Unit,
+) {
+	flow.flowWithLifecycle(lifecycle, Lifecycle.State.STARTED)
+		.onEach { listener(it) }
+		.launchIn(lifecycle.coroutineScope)
+}

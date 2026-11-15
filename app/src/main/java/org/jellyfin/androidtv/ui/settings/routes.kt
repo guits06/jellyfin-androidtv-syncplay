@@ -51,6 +51,7 @@ import org.jellyfin.androidtv.ui.settings.screen.playback.SettingsPlaybackPrerol
 import org.jellyfin.androidtv.ui.settings.screen.playback.SettingsPlaybackRefreshRateSwitchingBehaviorScreen
 import org.jellyfin.androidtv.ui.settings.screen.playback.SettingsPlaybackResumeSubtractDurationScreen
 import org.jellyfin.androidtv.ui.settings.screen.playback.SettingsPlaybackScreen
+import org.jellyfin.androidtv.ui.settings.screen.playback.SettingsPlaybackSyncPlayScreen
 import org.jellyfin.androidtv.ui.settings.screen.playback.SettingsPlaybackZoomModeScreen
 import org.jellyfin.androidtv.ui.settings.screen.playback.mediasegment.SettingsPlaybackMediaSegmentScreen
 import org.jellyfin.androidtv.ui.settings.screen.playback.mediasegment.SettingsPlaybackMediaSegmentsScreen
@@ -94,6 +95,7 @@ object Routes {
 	const val LIVETV_GUIDE_OPTIONS = "/livetv/guide/options"
 	const val LIVETV_GUIDE_CHANNEL_ORDER = "/livetv/guide/channel-order"
 	const val PLAYBACK = "/playback"
+	const val PLAYBACK_SYNCPLAY = "/playback/syncplay"
 	const val PLAYBACK_PLAYER = "/playback/player"
 	const val PLAYBACK_PHOTO_PLAYER = "/playback/photo-player"
 	const val PLAYBACK_NEXT_UP = "/playback/next-up"
@@ -226,6 +228,9 @@ val routes = mapOf<String, RouteComposable>(
 	},
 	Routes.PLAYBACK to {
 		SettingsPlaybackScreen()
+	},
+	Routes.PLAYBACK_SYNCPLAY to {
+		SettingsPlaybackSyncPlayScreen()
 	},
 	Routes.PLAYBACK_PLAYER to {
 		SettingsPlaybackPlayerScreen()

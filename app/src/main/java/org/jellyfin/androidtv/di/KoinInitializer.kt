@@ -19,6 +19,8 @@ class KoinInitializer : Initializer<KoinApplication> {
 			preferenceModule,
 			utilsModule,
 		)
+	}.also {
+		it.koin.createEagerInstances()
 	}
 
 	override fun dependencies() = listOf(LogInitializer::class.java)

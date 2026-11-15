@@ -23,6 +23,7 @@ import org.jellyfin.androidtv.preference.constant.NextUpBehavior;
 import org.jellyfin.androidtv.preference.constant.RefreshRateSwitchingBehavior;
 import org.jellyfin.androidtv.preference.constant.StillWatchingBehavior;
 import org.jellyfin.androidtv.preference.constant.ZoomMode;
+import org.jellyfin.androidtv.syncplay.SyncPlayPlaybackIntegration;
 import org.jellyfin.androidtv.ui.InteractionTrackerViewModel;
 import org.jellyfin.androidtv.ui.livetv.TvManager;
 import org.jellyfin.androidtv.util.TimeUtils;
@@ -49,7 +50,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import kotlin.Lazy;
 import timber.log.Timber;
@@ -67,6 +70,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     private Lazy<DataRefreshService> dataRefreshService = inject(DataRefreshService.class);
     private Lazy<ReportingHelper> reportingHelper = inject(ReportingHelper.class);
     private final Lazy<InteractionTrackerViewModel> lazyInteractionTracker = inject(InteractionTrackerViewModel.class);
+    private final Lazy<SyncPlayPlaybackIntegration> syncPlayIntegration = inject(SyncPlayPlaybackIntegration.class);
 
     List<BaseItemDto> mItems;
     VideoManager mVideoManager;
@@ -94,6 +98,25 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     }
 
     private void updateBurningSubs(StreamInfo response) {
+        if (response == null) {
+            burningSubs = false;
+            return;
+        }
+
+        Integer subIndex = mCurrentOptions != null ? mCurrentOptions.getSubtitleStreamIndex() : null;
+        if (subIndex != null && subIndex != -1) {
+            MediaSourceInfo mediaSource = response.getMediaSource();
+            if (mediaSource != null && mediaSource.getMediaStreams() != null) {
+                for (MediaStream stream : mediaSource.getMediaStreams()) {
+                    if (stream.getType() == MediaStreamType.SUBTITLE && stream.getIndex() == subIndex) {
+                        burningSubs = stream.getDeliveryMethod() == SubtitleDeliveryMethod.ENCODE
+                                || shouldBurnInSubtitles(response.getPlayMethod());
+                        return;
+                    }
+                }
+            }
+        }
+
         if (response.getSubtitleDeliveryMethod() == SubtitleDeliveryMethod.DROP) {
             burningSubs = false;
             return;
@@ -421,12 +444,15 @@ public class PlaybackController implements PlaybackControllerNotifiable {
 
         switch (mPlaybackState) {
             case PLAYING:
-                // do nothing
+                if (hasInitializedVideoManager() && !mVideoManager.isPlaying()) {
+                    mVideoManager.play();
+                }
                 break;
             case PAUSED:
                 if (!hasInitializedVideoManager()) {
                     return;
                 }
+                syncPlayIntegration.getValue().onUserPlay();
                 // just resume
                 mVideoManager.play();
                 mPlaybackState = PlaybackState.PLAYING; // won't get another onPrepared call
@@ -503,6 +529,19 @@ public class PlaybackController implements PlaybackControllerNotifiable {
                 mFragment.setPlayPauseActionState(0);
                 mFragment.setCurrentTime(position);
 
+                List<UUID> itemIds = new ArrayList<>();
+                if (mItems != null) {
+                    for (BaseItemDto itm : mItems) {
+                        if (itm != null && itm.getId() != null) {
+                            itemIds.add(itm.getId());
+                        }
+                    }
+                }
+                if (itemIds.isEmpty() && item != null && item.getId() != null) {
+                    itemIds.add(item.getId());
+                }
+                syncPlayIntegration.getValue().onUserStartPlayback(itemIds, mCurrentIndex, position * 10000L);
+
                 long duration = getCurrentlyPlayingItem().getRunTimeTicks() != null ? getCurrentlyPlayingItem().getRunTimeTicks() / 10000 : -1;
                 if (mVideoManager != null)
                     mVideoManager.setMetaDuration(duration);
@@ -530,7 +569,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             internalOptions.setSubtitleStreamIndex(forcedSubtitleIndex);
         }
         MediaSourceInfo currentMediaSource = getCurrentMediaSource();
-        if (forcedAudioLanguage != null) {
+        if (forcedAudioLanguage != null && currentMediaSource != null && currentMediaSource.getMediaStreams() != null) {
             // find the first audio stream with the requested language
             for (MediaStream stream : currentMediaSource.getMediaStreams()) {
                 if (stream.getType() == MediaStreamType.AUDIO && forcedAudioLanguage.equals(stream.getLanguage())) {
@@ -730,9 +769,9 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         // Use DefaultAudioStreamIndex for transcoding since they are encoded with only one stream
         //
         // Otherwise, query the players
-        if (mCurrentOptions.getAudioStreamIndex() != null) {
+        if (mCurrentOptions != null && mCurrentOptions.getAudioStreamIndex() != null) {
             currIndex = mCurrentOptions.getAudioStreamIndex();
-        } else if (isTranscoding() && getCurrentMediaSource().getDefaultAudioStreamIndex() != null) {
+        } else if (isTranscoding() && getCurrentMediaSource() != null && getCurrentMediaSource().getDefaultAudioStreamIndex() != null) {
             currIndex = getCurrentMediaSource().getDefaultAudioStreamIndex();
         } else if (hasInitializedVideoManager() && !isTranscoding()) {
             currIndex = mVideoManager.getExoPlayerTrack(MediaStreamType.AUDIO, getCurrentlyPlayingItem().getMediaStreams());
@@ -847,6 +886,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             Timber.d("already paused, ignoring");
             return;
         }
+        syncPlayIntegration.getValue().onUserPause();
         mPlaybackState = PlaybackState.PAUSED;
         if (hasInitializedVideoManager()) mVideoManager.pause();
         if (mFragment != null) {
@@ -901,6 +941,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         if (closeActivity && mFragment != null) {
             mFragment.closePlayer();
         }
+        syncPlayIntegration.getValue().onUserStop();
         stop();
         if (mVideoManager != null)
             mVideoManager.destroy();
@@ -928,6 +969,10 @@ public class PlaybackController implements PlaybackControllerNotifiable {
 
     public void next() {
         Timber.d("Next called.");
+        if (syncPlayIntegration.getValue().isInGroup()) {
+            syncPlayIntegration.getValue().onUserNext();
+            return;
+        }
         if (mCurrentIndex < mItems.size() - 1) {
             stop();
             resetPlayerErrors();
@@ -941,6 +986,10 @@ public class PlaybackController implements PlaybackControllerNotifiable {
 
     public void prev() {
         Timber.d("Prev called.");
+        if (syncPlayIntegration.getValue().isInGroup()) {
+            syncPlayIntegration.getValue().onUserPrevious();
+            return;
+        }
         if (mCurrentIndex > 0 && mItems.size() > 0) {
             stop();
             resetPlayerErrors();
@@ -975,6 +1024,8 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         if (!hasInitializedVideoManager()) {
             return;
         }
+
+        syncPlayIntegration.getValue().onUserSeek(pos);
 
         if (wasSeeking) {
             Timber.d("Previous seek has not finished - cancelling seek from %s to %d", mCurrentPosition, pos);
@@ -1226,6 +1277,11 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     }
 
     @Override
+    public void onBuffering() {
+        syncPlayIntegration.getValue().onPlayerBuffering();
+    }
+
+    @Override
     public void onPrepared() {
         if (mPlaybackState == PlaybackState.BUFFERING) {
             if (mFragment != null) {
@@ -1235,22 +1291,26 @@ public class PlaybackController implements PlaybackControllerNotifiable {
 
             mPlaybackState = PlaybackState.PLAYING;
             interactionTracker.notifyStart(getCurrentlyPlayingItem());
-            mCurrentTranscodeStartTime = mCurrentStreamInfo.getPlayMethod() == PlayMethod.TRANSCODE ? Instant.now().toEpochMilli() : 0;
+            mCurrentTranscodeStartTime = mCurrentStreamInfo != null && mCurrentStreamInfo.getPlayMethod() == PlayMethod.TRANSCODE ? Instant.now().toEpochMilli() : 0;
             startReportLoop();
         }
 
-        Timber.i("Play method: %s", mCurrentStreamInfo.getPlayMethod() == PlayMethod.TRANSCODE ? "Trans" : "Direct");
+        Timber.i("Play method: %s", mCurrentStreamInfo != null && mCurrentStreamInfo.getPlayMethod() == PlayMethod.TRANSCODE ? "Trans" : "Direct");
 
         if (mPlaybackState == PlaybackState.PAUSED) {
             mPlaybackState = PlaybackState.PLAYING;
         } else {
             if (!burningSubs) {
                 // Make sure the requested subtitles are enabled when external/embedded
-                Integer currentSubtitleIndex = mCurrentOptions.getSubtitleStreamIndex();
+                Integer currentSubtitleIndex = mCurrentOptions != null ? mCurrentOptions.getSubtitleStreamIndex() : null;
                 if (currentSubtitleIndex == null) currentSubtitleIndex = -1;
                 PlaybackControllerHelperKt.setSubtitleIndex(this, currentSubtitleIndex, true);
             } else {
                 PlaybackControllerHelperKt.disableDefaultSubtitles(this);
+            }
+
+            if (mPlaybackState == PlaybackState.IDLE || mPlaybackState == PlaybackState.BUFFERING) {
+                return;
             }
 
             // select an audio track
@@ -1258,13 +1318,16 @@ public class PlaybackController implements PlaybackControllerNotifiable {
 
             // if track switching is done without rebuilding the stream, mCurrentOptions is updated
             // otherwise, use the server default
-            if (mCurrentOptions.getAudioStreamIndex() != null) {
+            MediaSourceInfo currentMediaSource = getCurrentMediaSource();
+            if (mCurrentOptions != null && mCurrentOptions.getAudioStreamIndex() != null) {
                 eligibleAudioTrack = mCurrentOptions.getAudioStreamIndex();
-            } else if (getCurrentMediaSource().getDefaultAudioStreamIndex() != null) {
-                eligibleAudioTrack = getCurrentMediaSource().getDefaultAudioStreamIndex();
+            } else if (currentMediaSource != null && currentMediaSource.getDefaultAudioStreamIndex() != null) {
+                eligibleAudioTrack = currentMediaSource.getDefaultAudioStreamIndex();
             }
             switchAudioStream(eligibleAudioTrack);
         }
+
+        syncPlayIntegration.getValue().onPlayerPrepared();
     }
 
     @Override

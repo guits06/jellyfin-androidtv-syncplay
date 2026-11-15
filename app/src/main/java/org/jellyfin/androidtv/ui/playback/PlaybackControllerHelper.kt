@@ -93,14 +93,26 @@ fun PlaybackController.setSubtitleIndex(index: Int, force: Boolean = false) {
 		play(mCurrentPosition, index)
 	} else {
 		val mediaSource = currentMediaSource
+		if (mediaSource == null) {
+			Timber.w("Failed to get current media source for subtitle selection")
+			return
+		}
 		val stream = mediaSource.mediaStreams?.firstOrNull { it.type == MediaStreamType.SUBTITLE && it.index == index }
 		if (stream == null) {
 			Timber.w("Failed to find correct media stream")
 			return setSubtitleIndex(-1)
 		}
 
+		val streamInfo = currentStreamInfo
+		val requiresBake = stream.deliveryMethod == SubtitleDeliveryMethod.ENCODE ||
+			(streamInfo != null && shouldBurnInSubtitles(streamInfo.playMethod))
+
 		when {
-			stream.deliveryMethod == SubtitleDeliveryMethod.ENCODE || shouldBurnInSubtitles(currentStreamInfo.playMethod) -> {
+			requiresBake -> {
+				if (burningSubs && mCurrentOptions.subtitleStreamIndex == index) {
+					Timber.i("Subtitles already being baked for index $index, skipping restart")
+					return
+				}
 				Timber.i("Restarting playback for subtitle baking")
 
 				stop()

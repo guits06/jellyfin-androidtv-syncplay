@@ -67,6 +67,7 @@ import org.jellyfin.androidtv.ui.presentation.PositionableListRowPresenter;
 import org.jellyfin.androidtv.util.CoroutineUtils;
 import org.jellyfin.androidtv.util.DateTimeExtensionsKt;
 import org.jellyfin.androidtv.util.ImageHelper;
+import org.jellyfin.androidtv.syncplay.SyncPlayManager;
 import org.jellyfin.androidtv.util.InfoLayoutHelper;
 import org.jellyfin.androidtv.util.TextUtilsKt;
 import org.jellyfin.androidtv.util.TimeUtils;
@@ -76,6 +77,7 @@ import org.jellyfin.androidtv.util.sdk.BaseItemExtensionsKt;
 import org.jellyfin.sdk.model.api.BaseItemDto;
 import org.jellyfin.sdk.model.api.BaseItemKind;
 import org.jellyfin.sdk.model.api.ChapterInfo;
+import org.jellyfin.sdk.model.api.GroupInfoDto;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -135,6 +137,7 @@ public class CustomPlaybackOverlayFragment extends Fragment implements LiveTvGui
     private final Lazy<NavigationRepository> navigationRepository = inject(NavigationRepository.class);
     private final Lazy<BackgroundService> backgroundService = inject(BackgroundService.class);
     private final Lazy<ImageHelper> imageHelper = inject(ImageHelper.class);
+    private final Lazy<SyncPlayManager> syncPlayManager = inject(SyncPlayManager.class);
 
     private final PlaybackOverlayFragmentHelper helper = new PlaybackOverlayFragmentHelper(this);
 
@@ -301,6 +304,24 @@ public class CustomPlaybackOverlayFragment extends Fragment implements LiveTvGui
 
         // Set initial skip overlay state
         binding.skipOverlay.setSkipUiEnabled(!mIsVisible && !mGuideVisible && !mPopupPanelVisible);
+
+        // SyncPlay indicator
+        CoroutineUtils.observeFlowOnLifecycle(getViewLifecycleOwner().getLifecycle(), syncPlayManager.getValue().getCurrentGroup(), group -> {
+            updateSyncPlayIndicator(group);
+            return null;
+        });
+    }
+
+    private void updateSyncPlayIndicator(@Nullable GroupInfoDto group) {
+        if (binding == null || binding.syncplayIndicator == null) return;
+        if (group != null) {
+            int participants = group.getParticipants() != null ? group.getParticipants().size() : 1;
+            String text = getString(R.string.syncplay_indicator_format, group.getGroupName(), participants);
+            binding.syncplayIndicator.setText(text);
+            binding.syncplayIndicator.setVisibility(View.VISIBLE);
+        } else {
+            binding.syncplayIndicator.setVisibility(View.GONE);
+        }
     }
 
     @Override

@@ -67,6 +67,16 @@ fun SettingsPlaybackScreen() {
 
 		item {
 			ListButton(
+				leadingContent = { Icon(painterResource(R.drawable.ic_syncplay), contentDescription = null) },
+				headingContent = { Text(stringResource(R.string.syncplay_title)) },
+				captionContent = { Text(stringResource(R.string.syncplay_description)) },
+				onClick = { router.push(Routes.PLAYBACK_SYNCPLAY) },
+				modifier = Modifier.focusKey(Routes.PLAYBACK_SYNCPLAY)
+			)
+		}
+
+		item {
+			ListButton(
 				leadingContent = { Icon(painterResource(R.drawable.ic_photo), contentDescription = null) },
 				headingContent = { Text(stringResource(R.string.photo_player)) },
 				onClick = { router.push(Routes.PLAYBACK_PHOTO_PLAYER) },

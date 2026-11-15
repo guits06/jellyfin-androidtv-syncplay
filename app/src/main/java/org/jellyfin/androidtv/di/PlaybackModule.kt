@@ -12,6 +12,9 @@ import org.jellyfin.androidtv.R
 import org.jellyfin.androidtv.preference.UserPreferences
 import org.jellyfin.androidtv.preference.UserSettingPreferences
 import org.jellyfin.androidtv.preference.constant.BufferLength
+import org.jellyfin.androidtv.syncplay.SyncPlayClockSync
+import org.jellyfin.androidtv.syncplay.SyncPlayManager
+import org.jellyfin.androidtv.syncplay.SyncPlayPlaybackIntegration
 import org.jellyfin.androidtv.ui.browsing.MainActivity
 import org.jellyfin.androidtv.ui.playback.MediaManager
 import org.jellyfin.androidtv.ui.playback.PlaybackLauncher
@@ -53,6 +56,11 @@ val playbackModule = module {
 	}
 
 	single { createPlaybackManager() }
+
+	// SyncPlay
+	single { SyncPlayClockSync(get()) }
+	single(createdAtStart = true) { SyncPlayManager(get(), get(), get(), get()) }
+	single(createdAtStart = true) { SyncPlayPlaybackIntegration(androidContext(), get(), get(), get(), get()) }
 }
 
 fun Scope.createPlaybackManager() = playbackManager(androidContext()) {
