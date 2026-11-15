@@ -8,6 +8,7 @@ plugins {
 android {
 	namespace = "org.jellyfin.androidtv"
 	compileSdk = libs.versions.android.compileSdk.get().toInt()
+	ndkVersion = "24.0.8215888"
 
 	defaultConfig {
 		minSdk = libs.versions.android.minSdk.get().toInt()
@@ -18,6 +19,16 @@ android {
 		versionName = project.getVersionName()
 		versionCode = getVersionCode(versionName!!)
 		testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+		ndk {
+			abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+		}
+	}
+
+	externalNativeBuild {
+		cmake {
+			path = file("src/main/cpp/CMakeLists.txt")
+			version = "3.18.1"
+		}
 	}
 
 	buildFeatures {

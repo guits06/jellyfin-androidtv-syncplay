@@ -86,18 +86,8 @@ fun CinemaNavigationRail(
 	val palette = CinemaTheme.palette
 
 	var railHasFocus by remember { mutableStateOf(false) }
-	val railWidth by animateDpAsState(
-		targetValue = if (railHasFocus) 204.dp else CinemaSpacing.RailCollapsedWidth,
-		animationSpec = spring(
-			dampingRatio = Spring.DampingRatioNoBouncy,
-			stiffness = Spring.StiffnessMediumLow,
-		),
-		label = "NavRailWidth",
-	)
-	val railBg by animateColorAsState(
-		targetValue = if (railHasFocus) Color(0xEB0E0E15) else Color(0x990A0A0F),
-		label = "NavRailBg",
-	)
+	val railWidth = if (railHasFocus) 204.dp else CinemaSpacing.RailCollapsedWidth
+	val railBg = if (railHasFocus) Color(0xED0D0E14) else Color(0xA60A0A0F)
 
 	Column(
 		verticalArrangement = Arrangement.SpaceBetween,

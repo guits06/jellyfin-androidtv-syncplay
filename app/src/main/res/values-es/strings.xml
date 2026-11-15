@@ -758,4 +758,10 @@
     <string name="syncplay_state_paused">En pausa</string>
     <string name="syncplay_state_waiting">Sincronizando…</string>
     <string name="syncplay_state_idle">Listo</string>
+    <string name="lbl_tracks_count">%1$d pistas</string>
+    <string name="lbl_no_tracks">No hay pistas disponibles</string>
+    <string name="lbl_discography">Discografía</string>
+    <string name="action_watch_syncplay">Ver en SyncPlay</string>
+    <string name="lbl_synopsis">Sinopsis</string>
+    <string name="lbl_shuffle_short">Aleatorio</string>
 </resources>

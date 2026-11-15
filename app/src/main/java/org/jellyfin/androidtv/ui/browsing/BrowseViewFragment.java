@@ -1,5 +1,12 @@
 package org.jellyfin.androidtv.ui.browsing;
 
+import android.os.Bundle;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.leanback.widget.ArrayObjectAdapter;
 import androidx.leanback.widget.HeaderItem;
 import androidx.leanback.widget.ListRow;
@@ -33,8 +40,33 @@ import timber.log.Timber;
 public class BrowseViewFragment extends EnhancedBrowseFragment {
     private boolean isLiveTvLibrary;
 
+    private boolean useComposeSmartScreen() {
+        Bundle args = getArguments();
+        boolean isSeriesRecordings = args != null && args.getBoolean(Extras.IsLiveTvSeriesRecordings, false);
+        CollectionType type = mFolder != null && mFolder.getCollectionType() != null
+                ? mFolder.getCollectionType()
+                : CollectionType.UNKNOWN;
+        return mFolder != null && !isSeriesRecordings && type != CollectionType.LIVETV;
+    }
+
+    @Nullable
+    @Override
+    public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
+        if (useComposeSmartScreen()) {
+            return LibrarySmartScreenKt.createLibrarySmartComposeView(requireContext(), mFolder);
+        }
+        return super.onCreateView(inflater, container, savedInstanceState);
+    }
+
+    @Override
+    protected void setupEventListeners() {
+        if (useComposeSmartScreen()) return;
+        super.setupEventListeners();
+    }
+
     @Override
     protected void setupQueries(final RowLoader rowLoader) {
+        if (useComposeSmartScreen()) return;
         CollectionType type = mFolder != null && mFolder.getCollectionType() != null ? mFolder.getCollectionType() : CollectionType.UNKNOWN;
         switch (type) {
             case MOVIES:

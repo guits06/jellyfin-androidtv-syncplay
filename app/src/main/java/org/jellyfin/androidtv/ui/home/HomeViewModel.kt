@@ -157,7 +157,7 @@ class HomeViewModel(
 			val items = runCatching {
 				api.itemsApi.getResumeItems(
 					GetResumeItemsRequest(
-						limit = 30,
+						limit = 16,
 						fields = ItemRepository.browseFields,
 						imageTypeLimit = 1,
 						enableTotalRecordCount = false,
@@ -183,7 +183,7 @@ class HomeViewModel(
 				api.tvShowsApi.getNextUp(
 					GetNextUpRequest(
 						imageTypeLimit = 1,
-						limit = 30,
+						limit = 16,
 						enableResumable = false,
 						fields = ItemRepository.browseFields,
 						nextUpDateCutoff = cutoff,
@@ -213,7 +213,7 @@ class HomeViewModel(
 								imageTypeLimit = 1,
 								parentId = view.id,
 								groupItems = true,
-								limit = 28,
+								limit = 16,
 							)
 						).content
 					}.getOrDefault(emptyList())
@@ -264,10 +264,10 @@ class HomeViewModel(
 				api.liveTvApi.getRecommendedPrograms(
 					GetRecommendedProgramsRequest(
 						isAiring = true,
-						fields = ItemRepository.itemFields,
+						fields = ItemRepository.browseFields,
 						imageTypeLimit = 1,
 						enableTotalRecordCount = false,
-						limit = 20,
+						limit = 16,
 					)
 				).content.items
 			}.getOrDefault(emptyList())
@@ -285,9 +285,9 @@ class HomeViewModel(
 			val items = runCatching {
 				api.liveTvApi.getRecordings(
 					GetRecordingsRequest(
-						fields = ItemRepository.itemFields,
+						fields = ItemRepository.browseFields,
 						enableImages = true,
-						limit = 20,
+						limit = 16,
 					)
 				).content.items
 			}.getOrDefault(emptyList())
@@ -309,19 +309,25 @@ class HomeViewModel(
 		val images = dto.itemImages
 		val backdrop = (dto.itemBackdropImages.firstOrNull()
 			?: dto.parentBackdropImages.firstOrNull())
-			?.getUrl(api, maxWidth = 1280, maxHeight = 720)
+			?.getUrl(api, maxWidth = 640, maxHeight = 360)
 
-		val cardImg = if (landscape) {
-			(images[ImageType.THUMB]
+		val isSquareMusic = !landscape && (
+			dto.type == BaseItemKind.MUSIC_ALBUM ||
+				dto.type == BaseItemKind.MUSIC_ARTIST ||
+				dto.type == BaseItemKind.AUDIO
+			)
+		val cardImg = when {
+			landscape -> (images[ImageType.THUMB]
 				?: dto.itemBackdropImages.firstOrNull()
 				?: dto.parentBackdropImages.firstOrNull()
 				?: images[ImageType.PRIMARY])
-				?.getUrl(api, maxWidth = 520, maxHeight = 300)
-		} else {
-			(images[ImageType.PRIMARY]
+				?.getUrl(api, maxWidth = 320, maxHeight = 180)
+			isSquareMusic -> (images[ImageType.PRIMARY] ?: images[ImageType.THUMB])
+				?.getUrl(api, maxWidth = 220, maxHeight = 220)
+			else -> (images[ImageType.PRIMARY]
 				?: images[ImageType.THUMB]
 				?: dto.itemBackdropImages.firstOrNull())
-				?.getUrl(api, maxWidth = 340, maxHeight = 510)
+				?.getUrl(api, maxWidth = 220, maxHeight = 330)
 		}
 
 		val title = when (dto.type) {

@@ -6,8 +6,14 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentActivity
+import androidx.fragment.app.FragmentManager
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.flowWithLifecycle
 import androidx.lifecycle.lifecycleScope
@@ -25,8 +31,14 @@ import org.jellyfin.androidtv.ui.background.AppBackground
 import org.jellyfin.androidtv.ui.base.ProvideLocalInteractionTracker
 import org.jellyfin.androidtv.ui.composable.compat.AppNavigationHost
 import org.jellyfin.androidtv.ui.design.CinemaTheme
+import org.jellyfin.androidtv.ui.home.HomeFragment
+import org.jellyfin.androidtv.ui.itemdetail.FullDetailsFragment
+import org.jellyfin.androidtv.ui.itemdetail.ItemListFragment
+import org.jellyfin.androidtv.ui.itemdetail.MusicFavoritesListFragment
 import org.jellyfin.androidtv.ui.navigation.NavigationRepository
+import org.jellyfin.androidtv.ui.playback.AudioNowPlayingFragment
 import org.jellyfin.androidtv.ui.screensaver.InAppScreensaver
+import org.jellyfin.androidtv.ui.search.SearchFragment
 import org.jellyfin.androidtv.ui.settings.compat.MainActivitySettings
 import org.jellyfin.androidtv.ui.startup.StartupActivity
 import org.jellyfin.androidtv.util.applyTheme
@@ -63,11 +75,36 @@ class MainActivity : FragmentActivity() {
 			}.launchIn(lifecycleScope)
 
 		setContent {
+			var showLegacyBackground by remember { mutableStateOf(false) }
+
+			DisposableEffect(supportFragmentManager) {
+				val callback = object : FragmentManager.FragmentLifecycleCallbacks() {
+					override fun onFragmentResumed(fm: FragmentManager, f: Fragment) {
+						showLegacyBackground = f !is HomeFragment &&
+							f !is BrowseGridFragment &&
+							f !is BrowseViewFragment &&
+							f !is FullDetailsFragment &&
+							f !is ItemListFragment &&
+							f !is GenericFolderFragment &&
+							f !is CollectionFragment &&
+							f !is MusicFavoritesListFragment &&
+							f !is AudioNowPlayingFragment &&
+							f !is SearchFragment
+					}
+				}
+				supportFragmentManager.registerFragmentLifecycleCallbacks(callback, true)
+				onDispose {
+					supportFragmentManager.unregisterFragmentLifecycleCallbacks(callback)
+				}
+			}
+
 			CinemaTheme {
 				ProvideLocalInteractionTracker(
 					interactionTracker = { interactionTrackerViewModel.notifyInteraction(false, userInitiated = true) }
 				) {
-					AppBackground()
+					if (showLegacyBackground) {
+						AppBackground()
+					}
 					AppNavigationHost(
 						navigationRepository = navigationRepository,
 					)

@@ -1,8 +1,10 @@
 package org.jellyfin.androidtv.ui.design
 
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -27,17 +29,22 @@ import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -56,8 +63,13 @@ import coil3.compose.AsyncImage
 import coil3.request.ImageRequest
 import coil3.request.allowRgb565
 import coil3.request.crossfade
+import kotlinx.coroutines.launch
+import org.jellyfin.androidtv.util.AmbientPalette
 import org.jellyfin.sdk.model.api.GroupStateType
 import java.util.Locale
+
+private val CardShape = RoundedCornerShape(14.dp)
+private val PillShape = RoundedCornerShape(999.dp)
 
 @Composable
 fun CinemaAsyncImage(
@@ -65,8 +77,8 @@ fun CinemaAsyncImage(
 	contentDescription: String?,
 	modifier: Modifier = Modifier,
 	contentScale: ContentScale = ContentScale.Crop,
-	targetWidthDp: Dp = 320.dp,
-	targetHeightDp: Dp = 180.dp,
+	targetWidthDp: Dp = 240.dp,
+	targetHeightDp: Dp = 135.dp,
 	crossfadeMs: Int = 0,
 	fallbackColor: Color = CinemaTheme.palette.surfaceElevated,
 ) {
@@ -98,6 +110,43 @@ fun CinemaAsyncImage(
 	}
 }
 
+/**
+ * Zero-invalidation ambient background tinted cleanly using native C color extraction (libcinefast.so):
+ * swaps settled ambient colors smoothly using two cached static draws without per-frame Shader rebuilding.
+ */
+@Composable
+fun CinemaAmbientCanvas(
+	ambient: AmbientPalette,
+	modifier: Modifier = Modifier,
+) {
+	val palette = CinemaTheme.palette
+
+	Box(
+		modifier = modifier
+			.background(palette.canvas)
+			.drawWithCache {
+				val base = ambient.surfaceTint
+				val radial = Brush.radialGradient(
+					colors = listOf(
+						ambient.accentTint.copy(alpha = 0.68f),
+						base.copy(alpha = 0.42f),
+						Color.Transparent,
+					),
+					center = Offset(size.width * 0.78f, size.height * 0.18f),
+					radius = size.width * 0.75f,
+				)
+				onDrawBehind {
+					drawRect(radial)
+				}
+			}
+	)
+}
+
+/**
+ * Zero-recomposition TV focus card:
+ * Focus state animates an [Animatable] that is read only inside [graphicsLayer] (scale) and
+ * [drawWithContent] (focused ring + border), skipping both Composition and Layout during D-pad travel.
+ */
 @Composable
 fun CinemaMediaCard(
 	title: String,
@@ -106,8 +155,8 @@ fun CinemaMediaCard(
 	onClick: () -> Unit,
 	modifier: Modifier = Modifier,
 	onFocused: (() -> Unit)? = null,
-	cardWidth: Dp = 236.dp,
-	cardHeight: Dp = 133.dp,
+	cardWidth: Dp = 224.dp,
+	cardHeight: Dp = 126.dp,
 	progressFraction: Float? = null,
 	isWatched: Boolean = false,
 	unplayedCount: Int? = null,
@@ -115,100 +164,95 @@ fun CinemaMediaCard(
 	badgeText: String? = null,
 ) {
 	val palette = CinemaTheme.palette
-	var isFocused by remember { mutableStateOf(false) }
-	val focusScale by animateFloatAsState(
-		targetValue = if (isFocused) 1.06f else 1f,
-		animationSpec = CinemaMotion.FocusSpring,
-		label = "CardFocusScale",
-	)
+	val scope = rememberCoroutineScope()
+	val focusAnim = remember { Animatable(0f) }
+	val interactionSource = remember { MutableInteractionSource() }
+	val subtleBorder = palette.borderSubtle
+	val focusBorder = palette.focusRing
 
 	Column(
 		modifier = modifier
 			.width(cardWidth)
 			.graphicsLayer {
-				scaleX = focusScale
-				scaleY = focusScale
+				val p = focusAnim.value
+				val scale = 1f + (p * 0.055f)
+				scaleX = scale
+				scaleY = scale
 			},
 	) {
-		Surface(
-			onClick = onClick,
-			scale = ClickableSurfaceDefaults.scale(focusedScale = 1f, pressedScale = 0.98f),
-			shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(14.dp)),
-			colors = ClickableSurfaceDefaults.colors(
-				containerColor = palette.surfaceElevated,
-				focusedContainerColor = palette.surfaceBright,
-			),
-			border = ClickableSurfaceDefaults.border(
-				border = Border(BorderStroke(1.dp, palette.borderSubtle)),
-				focusedBorder = Border(BorderStroke(2.5.dp, palette.focusRing)),
-			),
+		Box(
 			modifier = Modifier
 				.width(cardWidth)
 				.height(cardHeight)
+				.clip(CardShape)
+				.background(palette.surfaceElevated)
 				.onFocusChanged { state ->
 					val nowFocused = state.isFocused
-					if (nowFocused && !isFocused) onFocused?.invoke()
-					isFocused = nowFocused
-				},
-		) {
-			Box(modifier = Modifier.fillMaxSize()) {
-				CinemaAsyncImage(
-					url = imageUrl,
-					contentDescription = title,
-					targetWidthDp = cardWidth * 1.15f,
-					targetHeightDp = cardHeight * 1.15f,
-					modifier = Modifier.fillMaxSize(),
-				)
-
-				// Subtle bottom gradient only drawn in GPU cache for badges & progress bar legibility
-				Box(
-					modifier = Modifier
-						.fillMaxSize()
-						.drawWithCache {
-							val scrim = Brush.verticalGradient(
-								0.48f to Color.Transparent,
-								1.0f to Color(0xCC08080D),
-							)
-							onDrawWithContent {
-								drawRect(scrim)
-								drawContent()
-							}
-						}
-				)
-
-				CardOverlayBadges(
-					isWatched = isWatched,
-					unplayedCount = unplayedCount,
-					communityRating = communityRating,
-					badgeText = badgeText,
-				)
-
-				if (progressFraction != null && progressFraction > 0f) {
-					val clamped = progressFraction.coerceIn(0f, 1f)
-					Box(
-						modifier = Modifier
-							.align(Alignment.BottomCenter)
-							.fillMaxWidth()
-							.height(4.dp)
-							.background(Color(0x66FFFFFF))
-					) {
-						Box(
-							modifier = Modifier
-								.fillMaxWidth(clamped)
-								.fillMaxHeight()
-								.background(palette.accentPrimary)
+					if (nowFocused) onFocused?.invoke()
+					scope.launch {
+						focusAnim.animateTo(
+							targetValue = if (nowFocused) 1f else 0f,
+							animationSpec = CinemaMotion.FocusSpring,
 						)
 					}
+				}
+				.clickable(
+					interactionSource = interactionSource,
+					indication = null,
+					onClick = onClick,
+				)
+				.drawWithContent {
+					drawContent()
+					val p = focusAnim.value
+					val corner = 14.dp.toPx()
+					val strokeWidth = (1.dp + 1.6.dp * p).toPx()
+					drawRoundRect(
+						color = lerp(subtleBorder, focusBorder, p),
+						cornerRadius = CornerRadius(corner, corner),
+						style = Stroke(width = strokeWidth),
+					)
+				},
+		) {
+			CinemaAsyncImage(
+				url = imageUrl,
+				contentDescription = title,
+				targetWidthDp = cardWidth,
+				targetHeightDp = cardHeight,
+				modifier = Modifier.fillMaxSize(),
+			)
+
+			CardOverlayBadges(
+				isWatched = isWatched,
+				unplayedCount = unplayedCount,
+				communityRating = communityRating,
+				badgeText = badgeText,
+			)
+
+			if (progressFraction != null && progressFraction > 0f) {
+				val clamped = progressFraction.coerceIn(0f, 1f)
+				Box(
+					modifier = Modifier
+						.align(Alignment.BottomCenter)
+						.fillMaxWidth()
+						.height(4.dp)
+						.background(Color(0x9908080D))
+				) {
+					Box(
+						modifier = Modifier
+							.fillMaxWidth(clamped)
+							.fillMaxHeight()
+							.background(palette.accentPrimary)
+					)
 				}
 			}
 		}
 
-		Spacer(modifier = Modifier.height(7.dp))
+		Spacer(modifier = Modifier.height(6.dp))
 
 		Text(
 			text = title,
 			style = MaterialTheme.typography.titleMedium,
-			color = if (isFocused) palette.textPrimary else palette.textPrimary.copy(alpha = 0.88f),
+			color = palette.textPrimary,
 			maxLines = 1,
 			overflow = TextOverflow.Ellipsis,
 			modifier = Modifier.padding(horizontal = 2.dp),
@@ -218,7 +262,7 @@ fun CinemaMediaCard(
 			Text(
 				text = subtitle,
 				style = MaterialTheme.typography.bodyMedium,
-				color = if (isFocused) palette.textSecondary else palette.textMuted,
+				color = palette.textMuted,
 				maxLines = 1,
 				overflow = TextOverflow.Ellipsis,
 				modifier = Modifier.padding(horizontal = 2.dp),
@@ -240,9 +284,9 @@ private fun BoxScope.CardOverlayBadges(
 		Box(
 			modifier = Modifier
 				.align(Alignment.TopStart)
-				.padding(8.dp)
+				.padding(7.dp)
 				.clip(RoundedCornerShape(6.dp))
-				.background(Color(0xB80A0A0F))
+				.background(Color(0xCC0A0A0F))
 				.padding(horizontal = 7.dp, vertical = 3.dp)
 		) {
 			Text(
@@ -257,9 +301,9 @@ private fun BoxScope.CardOverlayBadges(
 			horizontalArrangement = Arrangement.spacedBy(3.dp),
 			modifier = Modifier
 				.align(Alignment.TopStart)
-				.padding(8.dp)
+				.padding(7.dp)
 				.clip(RoundedCornerShape(6.dp))
-				.background(Color(0xB80A0A0F))
+				.background(Color(0xCC0A0A0F))
 				.padding(horizontal = 6.dp, vertical = 2.dp)
 		) {
 			Icon(
@@ -280,8 +324,8 @@ private fun BoxScope.CardOverlayBadges(
 		Box(
 			modifier = Modifier
 				.align(Alignment.TopEnd)
-				.padding(8.dp)
-				.clip(RoundedCornerShape(999.dp))
+				.padding(7.dp)
+				.clip(PillShape)
 				.background(palette.accentPrimary)
 				.padding(horizontal = 8.dp, vertical = 2.dp)
 		) {
@@ -295,8 +339,8 @@ private fun BoxScope.CardOverlayBadges(
 		Box(
 			modifier = Modifier
 				.align(Alignment.TopEnd)
-				.padding(8.dp)
-				.size(22.dp)
+				.padding(7.dp)
+				.size(21.dp)
 				.clip(CircleShape)
 				.background(palette.accentSecondary),
 			contentAlignment = Alignment.Center,
@@ -305,7 +349,7 @@ private fun BoxScope.CardOverlayBadges(
 				imageVector = Icons.Rounded.Check,
 				contentDescription = null,
 				tint = Color(0xFF06131A),
-				modifier = Modifier.size(14.dp),
+				modifier = Modifier.size(13.dp),
 			)
 		}
 	}
@@ -321,60 +365,71 @@ fun CinemaActionButton(
 	accentColor: Color? = null,
 ) {
 	val palette = CinemaTheme.palette
-	var isFocused by remember { mutableStateOf(false) }
-	val scale by animateFloatAsState(
-		targetValue = if (isFocused) 1.05f else 1f,
-		animationSpec = CinemaMotion.PillSpring,
-		label = "ActionBtnScale",
-	)
+	val scope = rememberCoroutineScope()
+	val focusAnim = remember { Animatable(0f) }
+	val interactionSource = remember { MutableInteractionSource() }
+
 	val baseContainer = when {
 		accentColor != null -> accentColor
-		primary -> palette.textPrimary
-		else -> palette.surfaceElevated.copy(alpha = 0.92f)
+		primary -> palette.accentPrimary.copy(alpha = 0.78f)
+		else -> palette.surfaceElevated.copy(alpha = 0.94f)
 	}
 	val focusedContainer = when {
 		accentColor != null -> accentColor
-		primary -> Color.White
+		primary -> palette.accentPrimary
 		else -> palette.surfaceBright
 	}
-	val baseContent = if (primary && accentColor == null) palette.canvas else palette.textPrimary
+	val baseContent = palette.textPrimary
+	val ringColor = palette.focusRing
+	val subtleColor = palette.borderSubtle
 
-	Surface(
-		onClick = onClick,
-		scale = ClickableSurfaceDefaults.scale(focusedScale = 1f, pressedScale = 0.97f),
-		shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(999.dp)),
-		colors = ClickableSurfaceDefaults.colors(
-			containerColor = baseContainer,
-			contentColor = baseContent,
-			focusedContainerColor = focusedContainer,
-			focusedContentColor = baseContent,
-		),
-		border = ClickableSurfaceDefaults.border(
-			border = Border(BorderStroke(1.dp, palette.borderSubtle)),
-			focusedBorder = Border(BorderStroke(2.dp, if (primary) palette.accentPrimary else palette.focusRing)),
-		),
+	Box(
 		modifier = modifier
 			.graphicsLayer {
+				val p = focusAnim.value
+				val scale = 1f + p * 0.055f
 				scaleX = scale
 				scaleY = scale
 			}
-			.onFocusChanged { isFocused = it.isFocused },
+			.clip(PillShape)
+			.drawBehind {
+				val p = focusAnim.value
+				drawRect(lerp(baseContainer, focusedContainer, p))
+				drawRoundRect(
+					color = lerp(subtleColor, ringColor, p),
+					cornerRadius = CornerRadius(size.height / 2f, size.height / 2f),
+					style = Stroke(width = (1.dp + 1.8.dp * p).toPx()),
+				)
+			}
+			.onFocusChanged { state ->
+				val focused = state.isFocused
+				scope.launch {
+					focusAnim.animateTo(if (focused) 1f else 0f, CinemaMotion.PillSpring)
+				}
+			}
+			.clickable(
+				interactionSource = interactionSource,
+				indication = null,
+				onClick = onClick,
+			)
+			.padding(horizontal = 20.dp, vertical = 11.dp),
 	) {
 		Row(
 			verticalAlignment = Alignment.CenterVertically,
 			horizontalArrangement = Arrangement.spacedBy(8.dp),
-			modifier = Modifier.padding(horizontal = 20.dp, vertical = 11.dp),
 		) {
 			if (icon != null) {
 				Icon(
 					imageVector = icon,
 					contentDescription = null,
+					tint = baseContent,
 					modifier = Modifier.size(18.dp),
 				)
 			}
 			Text(
 				text = text,
 				style = MaterialTheme.typography.labelLarge,
+				color = baseContent,
 				maxLines = 1,
 			)
 		}
@@ -390,49 +445,63 @@ fun CinemaFilterChip(
 	icon: ImageVector? = null,
 ) {
 	val palette = CinemaTheme.palette
-	var isFocused by remember { mutableStateOf(false) }
-	val scale by animateFloatAsState(
-		targetValue = if (isFocused) 1.05f else 1f,
-		animationSpec = CinemaMotion.PillSpring,
-		label = "ChipScale",
-	)
+	val scope = rememberCoroutineScope()
+	val focusAnim = remember { Animatable(0f) }
+	val interactionSource = remember { MutableInteractionSource() }
 
-	Surface(
-		onClick = onClick,
-		scale = ClickableSurfaceDefaults.scale(focusedScale = 1f, pressedScale = 0.97f),
-		shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(999.dp)),
-		colors = ClickableSurfaceDefaults.colors(
-			containerColor = if (selected) palette.accentSecondary.copy(alpha = 0.22f) else palette.surfaceElevated,
-			contentColor = if (selected) palette.accentSecondary else palette.textSecondary,
-			focusedContainerColor = if (selected) palette.accentSecondary else palette.surfaceBright,
-			focusedContentColor = if (selected) Color(0xFF06131A) else palette.textPrimary,
-		),
-		border = ClickableSurfaceDefaults.border(
-			border = Border(BorderStroke(1.dp, if (selected) palette.accentSecondary else palette.borderSubtle)),
-			focusedBorder = Border(BorderStroke(2.dp, palette.focusRing)),
-		),
+	val unfocusedBg = if (selected) palette.accentSecondary.copy(alpha = 0.20f) else palette.surfaceElevated
+	val focusedBg = if (selected) palette.accentSecondary.copy(alpha = 0.42f) else palette.surfaceBright
+	val unfocusedBorder = if (selected) palette.accentSecondary else palette.borderSubtle
+	val focusRing = palette.focusRing
+	val contentColor = if (selected) Color.White else palette.textPrimary
+
+	Box(
 		modifier = modifier
 			.graphicsLayer {
+				val p = focusAnim.value
+				val scale = 1f + p * 0.045f
 				scaleX = scale
 				scaleY = scale
 			}
-			.onFocusChanged { isFocused = it.isFocused },
+			.clip(PillShape)
+			.drawBehind {
+				val p = focusAnim.value
+				drawRect(lerp(unfocusedBg, focusedBg, p))
+				drawRoundRect(
+					color = lerp(unfocusedBorder, focusRing, p),
+					cornerRadius = CornerRadius(size.height / 2f, size.height / 2f),
+					style = Stroke(width = (1.dp + 1.2.dp * p).toPx()),
+				)
+			}
+			.onFocusChanged { state ->
+				val focused = state.isFocused
+				scope.launch {
+					focusAnim.animateTo(if (focused) 1f else 0f, CinemaMotion.PillSpring)
+				}
+			}
+			.clickable(
+				interactionSource = interactionSource,
+				indication = null,
+				onClick = onClick,
+			)
+			.padding(horizontal = 14.dp, vertical = 8.dp),
 	) {
 		Row(
 			verticalAlignment = Alignment.CenterVertically,
 			horizontalArrangement = Arrangement.spacedBy(6.dp),
-			modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
 		) {
 			if (icon != null) {
 				Icon(
 					imageVector = icon,
 					contentDescription = null,
+					tint = contentColor,
 					modifier = Modifier.size(15.dp),
 				)
 			}
 			Text(
 				text = text,
 				style = MaterialTheme.typography.labelMedium,
+				color = contentColor,
 				maxLines = 1,
 			)
 		}
@@ -457,7 +526,7 @@ fun SyncPlayStatusPill(
 	Surface(
 		onClick = onClick,
 		scale = ClickableSurfaceDefaults.scale(focusedScale = 1.05f),
-		shape = ClickableSurfaceDefaults.shape(shape = RoundedCornerShape(999.dp)),
+		shape = ClickableSurfaceDefaults.shape(shape = PillShape),
 		colors = ClickableSurfaceDefaults.colors(
 			containerColor = Color(0xCC161C24),
 			focusedContainerColor = Color(0xFF212B38),
@@ -518,7 +587,7 @@ fun <T> CinemaSectionRow(
 				modifier = Modifier
 					.width(4.dp)
 					.height(18.dp)
-					.clip(RoundedCornerShape(999.dp))
+					.clip(PillShape)
 					.background(palette.accentPrimary)
 			)
 			Text(

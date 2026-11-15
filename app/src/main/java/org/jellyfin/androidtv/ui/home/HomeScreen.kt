@@ -1,10 +1,5 @@
 package org.jellyfin.androidtv.ui.home
 
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
@@ -41,7 +36,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.focus.FocusRequester
@@ -49,6 +43,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -65,12 +60,14 @@ import kotlinx.coroutines.launch
 import org.jellyfin.androidtv.R
 import org.jellyfin.androidtv.syncplay.SyncPlayManager
 import org.jellyfin.androidtv.ui.design.CinemaActionButton
+import org.jellyfin.androidtv.ui.design.CinemaAmbientCanvas
 import org.jellyfin.androidtv.ui.design.CinemaAsyncImage
 import org.jellyfin.androidtv.ui.design.CinemaMediaCard
 import org.jellyfin.androidtv.ui.design.CinemaNavDestination
 import org.jellyfin.androidtv.ui.design.CinemaNavigationRail
 import org.jellyfin.androidtv.ui.design.CinemaSectionRow
 import org.jellyfin.androidtv.ui.design.CinemaTheme
+import org.jellyfin.androidtv.ui.design.CinemaSpacing
 import org.jellyfin.androidtv.ui.design.SyncPlayStatusPill
 import org.jellyfin.androidtv.ui.itemhandling.BaseItemDtoBaseRowItem
 import org.jellyfin.androidtv.ui.itemhandling.ItemLauncher
@@ -79,6 +76,7 @@ import org.jellyfin.androidtv.ui.navigation.NavigationRepository
 import org.jellyfin.androidtv.ui.settings.Routes
 import org.jellyfin.androidtv.ui.settings.compat.SettingsViewModel
 import org.jellyfin.androidtv.util.PlaybackHelper
+import org.jellyfin.androidtv.util.rememberAmbientPalette
 import org.jellyfin.sdk.model.api.BaseItemKind
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
@@ -136,29 +134,30 @@ fun HomeScreen(
 		}
 	}
 
-	Box(
-		modifier = Modifier
-			.fillMaxSize()
-			.background(palette.canvas)
-	) {
-		// Top-level backdrop canvas anchored cleanly in the upper-right billboard area
-		val hero = displayedHero ?: uiState.heroDefault
-		HeroBackdropLayer(
-			backdropUrl = hero?.backdropUrl,
-			modifier = Modifier
-				.fillMaxWidth()
-				.fillMaxHeight(0.66f)
-				.align(Alignment.TopEnd)
-				.alpha(if (backdropDimmed) 0.28f else 1f),
+	val hero = displayedHero ?: uiState.heroDefault
+	val ambientPalette = rememberAmbientPalette(hero?.backdropUrl ?: hero?.cardImageUrl)
+
+	Box(modifier = Modifier.fillMaxSize()) {
+		CinemaAmbientCanvas(
+			ambient = ambientPalette,
+			modifier = Modifier.fillMaxSize(),
 		)
 
-		Row(modifier = Modifier.fillMaxSize()) {
-			CinemaNavigationRail(activeDestination = CinemaNavDestination.HOME)
+		// Single compact backdrop canvas without offscreen RenderNode alpha layers
+		HeroBackdropLayer(
+			backdropUrl = hero?.backdropUrl,
+			dimmed = backdropDimmed,
+			modifier = Modifier
+				.fillMaxWidth(0.76f)
+				.fillMaxHeight(0.62f)
+				.align(Alignment.TopEnd),
+		)
 
+		Box(modifier = Modifier.fillMaxSize()) {
 			Box(
 				modifier = Modifier
-					.weight(1f)
-					.fillMaxHeight()
+					.fillMaxSize()
+					.padding(start = CinemaSpacing.RailCollapsedWidth)
 					.focusGroup()
 			) {
 				if (uiState.isLoading && uiState.sections.isEmpty()) {
@@ -253,6 +252,11 @@ fun HomeScreen(
 					)
 				}
 			}
+
+			CinemaNavigationRail(
+				activeDestination = CinemaNavDestination.HOME,
+				modifier = Modifier.align(Alignment.CenterStart),
+			)
 		}
 	}
 }
@@ -260,47 +264,42 @@ fun HomeScreen(
 @Composable
 private fun HeroBackdropLayer(
 	backdropUrl: String?,
+	dimmed: Boolean,
 	modifier: Modifier = Modifier,
 ) {
 	val palette = CinemaTheme.palette
 	Box(modifier = modifier) {
-		AnimatedContent(
-			targetState = backdropUrl,
-			transitionSpec = {
-				fadeIn(tween(260)) togetherWith fadeOut(tween(220))
-			},
-			label = "HeroBackdrop",
-		) { url ->
-			CinemaAsyncImage(
-				url = url,
-				contentDescription = null,
-				contentScale = ContentScale.Crop,
-				targetWidthDp = 960.dp,
-				targetHeightDp = 540.dp,
-				crossfadeMs = 0,
-				fallbackColor = palette.canvas,
-				modifier = Modifier.fillMaxSize(),
-			)
-		}
+		CinemaAsyncImage(
+			url = backdropUrl,
+			contentDescription = null,
+			contentScale = ContentScale.Crop,
+			targetWidthDp = 480.dp,
+			targetHeightDp = 270.dp,
+			crossfadeMs = 150,
+			fallbackColor = palette.canvas,
+			modifier = Modifier.fillMaxSize(),
+		)
 
-		// Two cached GPU gradient scrims (left feather + bottom blend) with zero RenderEffect blur
+		// Single cached GPU gradient scrim (plus optional dim tint, avoiding offscreen saveLayer alpha)
 		Box(
 			modifier = Modifier
 				.fillMaxSize()
 				.drawWithCache {
 					val horizontal = Brush.horizontalGradient(
 						0.0f to palette.canvas,
-						0.32f to palette.canvas.copy(alpha = 0.88f),
-						0.68f to palette.canvas.copy(alpha = 0.35f),
+						0.28f to palette.canvas.copy(alpha = 0.85f),
+						0.66f to palette.canvas.copy(alpha = 0.28f),
 						1.0f to Color.Transparent,
 					)
 					val vertical = Brush.verticalGradient(
-						0.0f to palette.canvas.copy(alpha = 0.25f),
-						0.55f to Color.Transparent,
-						0.85f to palette.canvas.copy(alpha = 0.85f),
+						0.0f to palette.canvas.copy(alpha = 0.18f),
+						0.58f to Color.Transparent,
+						0.88f to palette.canvas.copy(alpha = 0.88f),
 						1.0f to palette.canvas,
 					)
+					val dimScrim = palette.canvas.copy(alpha = if (dimmed) 0.72f else 0.08f)
 					onDrawWithContent {
+						drawRect(dimScrim)
 						drawRect(horizontal)
 						drawRect(vertical)
 					}
