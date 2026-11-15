@@ -35,6 +35,7 @@ import org.jellyfin.sdk.model.api.NewGroupRequestDto
 import org.jellyfin.sdk.model.api.NextItemRequestDto
 import org.jellyfin.sdk.model.api.PlayQueueUpdate
 import org.jellyfin.sdk.model.api.PlayRequestDto
+import org.jellyfin.sdk.model.api.PlaybackRequestType
 import org.jellyfin.sdk.model.api.PreviousItemRequestDto
 import org.jellyfin.sdk.model.api.ReadyRequestDto
 import org.jellyfin.sdk.model.api.SeekRequestDto
@@ -80,12 +81,18 @@ class SyncPlayManager(
 	private val _groupState = MutableStateFlow(GroupStateType.IDLE)
 	val groupState: StateFlow<GroupStateType> = _groupState.asStateFlow()
 
+	private val _lastStateReason = MutableStateFlow<PlaybackRequestType?>(null)
+	val lastStateReason: StateFlow<PlaybackRequestType?> = _lastStateReason.asStateFlow()
+
 	val isInGroup: StateFlow<Boolean> = _currentGroup
 		.map { it != null }
 		.stateIn(coroutineScope, SharingStarted.Eagerly, false)
 
 	private val _commands = MutableSharedFlow<SendCommand>(extraBufferCapacity = 64)
 	val commands: SharedFlow<SendCommand> = _commands.asSharedFlow()
+
+	private val _reconnected = MutableSharedFlow<Unit>(extraBufferCapacity = 8)
+	val reconnected: SharedFlow<Unit> = _reconnected.asSharedFlow()
 
 	@Volatile
 	var isHandlingRemoteCommand: Boolean = false
@@ -99,7 +106,14 @@ class SyncPlayManager(
 		api.webSocket.subscribe<SyncPlayCommandMessage>()
 			.onEach { message ->
 				val command = message.data ?: return@onEach
-				Timber.i("SyncPlayManager: Received command ${command.command} for group ${command.groupId}")
+				Timber.tag("SyncPlay").i(
+					"WS Command=%s group=%s when=%s posTicks=%s item=%s",
+					command.command,
+					command.groupId,
+					command.`when`,
+					command.positionTicks,
+					command.playlistItemId,
+				)
 				_commands.emit(command)
 			}
 			.launchIn(coroutineScope)
@@ -114,14 +128,18 @@ class SyncPlayManager(
 			.onEach { state ->
 				if (state is SocketApiState.Connected) {
 					if (isInGroup.value) {
-						Timber.i("SyncPlayManager: WebSocket reconnected while in group. Resyncing...")
+						Timber.tag("SyncPlay").i("WebSocket reconnected while in group; resyncing clock and group state")
 						coroutineScope.launch {
 							clockSync.synchronizeTime()
 							val groupId = _currentGroup.value?.groupId ?: return@launch
-							getGroup(groupId).onFailure {
-								Timber.w("SyncPlayManager: Group no longer accessible after reconnect")
-								clearGroupState()
-							}
+							getGroup(groupId)
+								.onSuccess {
+									_reconnected.tryEmit(Unit)
+								}
+								.onFailure {
+									Timber.tag("SyncPlay").w("Group %s no longer accessible after reconnect", groupId)
+									clearGroupState()
+								}
 						}
 					} else {
 						coroutineScope.launch {
@@ -207,13 +225,21 @@ class SyncPlayManager(
 			}
 
 			is SyncPlayStateUpdate -> {
+				_lastStateReason.value = update.data.reason
 				_groupState.value = update.data.state
-				Timber.i("SyncPlayManager: Group state updated to ${update.data.state}")
+				Timber.tag("SyncPlay").i("Group state -> %s (reason=%s)", update.data.state, update.data.reason)
 			}
 
 			is SyncPlayPlayQueueUpdate -> {
 				_playQueue.value = update.data
-				Timber.i("SyncPlayManager: PlayQueue updated with ${update.data.playlist.size} items, playingIndex=${update.data.playingItemIndex}")
+				Timber.tag("SyncPlay").i(
+					"PlayQueue -> reason=%s items=%d playingIndex=%d startTicks=%d isPlaying=%s",
+					update.data.reason,
+					update.data.playlist.size,
+					update.data.playingItemIndex,
+					update.data.startPositionTicks,
+					update.data.isPlaying,
+				)
 			}
 
 			is SyncPlayUserJoinedUpdate -> {
@@ -246,6 +272,7 @@ class SyncPlayManager(
 	fun clearGroupState() {
 		_currentGroup.value = null
 		_playQueue.value = null
+		_lastStateReason.value = null
 		_groupState.value = GroupStateType.IDLE
 	}
 

@@ -87,6 +87,8 @@ public class VideoManager {
     private long mMetaDuration = -1;
     private long lastExoPlayerPosition = -1;
     private boolean nightModeEnabled;
+    private boolean hasNotifiedInitialPrepared = false;
+    private boolean isCurrentlyBuffering = false;
 
     public boolean isContracted = false;
 
@@ -149,23 +151,42 @@ public class VideoManager {
             @Override
             public void onIsPlayingChanged(boolean isPlaying) {
                 if (isPlaying) {
-                    if (mPlaybackControllerNotifiable != null) mPlaybackControllerNotifiable.onPrepared();
+                    if (!hasNotifiedInitialPrepared) {
+                        hasNotifiedInitialPrepared = true;
+                        if (mPlaybackControllerNotifiable != null) mPlaybackControllerNotifiable.onPrepared();
+                    }
                     startProgressLoop();
                     _helper.setScreensaverLock(true);
                 } else {
                     stopProgressLoop();
                     _helper.setScreensaverLock(false);
                 }
+                if (mPlaybackControllerNotifiable != null) {
+                    mPlaybackControllerNotifiable.onPlayStateChanged(isPlaying);
+                }
             }
 
             @Override
             public void onPlaybackStateChanged(int playbackState) {
+                if (playbackState == Player.STATE_READY) {
+                    if (!hasNotifiedInitialPrepared) {
+                        hasNotifiedInitialPrepared = true;
+                        if (mPlaybackControllerNotifiable != null) mPlaybackControllerNotifiable.onPrepared();
+                    }
+                    if (isCurrentlyBuffering) {
+                        isCurrentlyBuffering = false;
+                        if (mPlaybackControllerNotifiable != null) mPlaybackControllerNotifiable.onBufferingEnded();
+                    }
+                }
+
                 if (playbackState == Player.STATE_BUFFERING) {
                     Timber.d("Player is buffering");
+                    isCurrentlyBuffering = true;
                     if (mPlaybackControllerNotifiable != null) mPlaybackControllerNotifiable.onBuffering();
                 }
 
                 if (playbackState == Player.STATE_ENDED) {
+                    isCurrentlyBuffering = false;
                     if (mPlaybackControllerNotifiable != null) mPlaybackControllerNotifiable.onCompletion();
                     stopProgressLoop();
                 }
@@ -327,29 +348,39 @@ public class VideoManager {
     }
 
     public boolean isPlaying() {
-        return mExoPlayer.isPlaying();
+        return mExoPlayer != null && mExoPlayer.isPlaying();
     }
 
     public void start() {
+        start(true);
+    }
+
+    public void start(boolean playWhenReady) {
         if (mExoPlayer == null) {
             Timber.e("mExoPlayer should not be null!!");
             _helper.getFragment().closePlayer();
             return;
         }
-        mExoPlayer.setPlayWhenReady(true);
+        mExoPlayer.setPlayWhenReady(playWhenReady);
         normalWidth = mExoPlayerView.getLayoutParams().width;
         normalHeight = mExoPlayerView.getLayoutParams().height;
     }
 
     public void play() {
-        mExoPlayer.setPlayWhenReady(true);
+        if (mExoPlayer != null) {
+            mExoPlayer.setPlayWhenReady(true);
+        }
     }
 
     public void pause() {
-        mExoPlayer.setPlayWhenReady(false);
+        if (mExoPlayer != null) {
+            mExoPlayer.setPlayWhenReady(false);
+        }
     }
 
     public void stopPlayback() {
+        hasNotifiedInitialPrepared = false;
+        isCurrentlyBuffering = false;
         if (mExoPlayer != null) {
             mExoPlayer.stop();
 
@@ -395,10 +426,15 @@ public class VideoManager {
         }
         Timber.i("Video path set to: %s", path);
 
+        hasNotifiedInitialPrepared = false;
+        isCurrentlyBuffering = false;
         try {
             // Add external subtitles
             List<MediaItem.SubtitleConfiguration> subtitleConfigurations = new ArrayList<>();
-            for (MediaStream mediaStream : streamInfo.getMediaSource().getMediaStreams()) {
+            List<MediaStream> streams = streamInfo.getMediaSource() != null && streamInfo.getMediaSource().getMediaStreams() != null
+                    ? streamInfo.getMediaSource().getMediaStreams()
+                    : Collections.emptyList();
+            for (MediaStream mediaStream : streams) {
                 if (mediaStream.getType() != MediaStreamType.SUBTITLE) continue;
 
                 if (mediaStream.getDeliveryMethod() == SubtitleDeliveryMethod.EXTERNAL) {
@@ -420,8 +456,10 @@ public class VideoManager {
                     .setSubtitleConfigurations(subtitleConfigurations)
                     .build();
 
-            mExoPlayer.setMediaItem(mediaItem);
-            mExoPlayer.prepare();
+            if (mExoPlayer != null) {
+                mExoPlayer.setMediaItem(mediaItem);
+                mExoPlayer.prepare();
+            }
         } catch (IllegalStateException e) {
             Timber.e(e, "Unable to set video path.  Probably backing out.");
         }
@@ -592,6 +630,7 @@ public class VideoManager {
     }
 
     public void setPlaybackSpeed(float speed) {
+        if (!isInitialized()) return;
         if (speed < 0.25) {
             Timber.w("Invalid playback speed requested: %f", speed);
             return;

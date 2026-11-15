@@ -7,4 +7,6 @@ interface PlaybackControllerNotifiable {
 	fun onProgress()
 	fun onPlaybackSpeedChange(newSpeed: Float)
 	fun onBuffering() {}
+	fun onBufferingEnded() {}
+	fun onPlayStateChanged(isPlaying: Boolean) {}
 }

@@ -20,6 +20,7 @@ class SyncPlayClockSync(
 	private val api: ApiClient,
 	private val timeSyncApi: TimeSyncApi? = null,
 	private val syncPlayApi: SyncPlayApi? = null,
+	private val nowMs: () -> Long = { System.currentTimeMillis() },
 ) {
 	private val effectiveTimeSyncApi: TimeSyncApi get() = timeSyncApi ?: api.timeSyncApi
 	private val effectiveSyncPlayApi: SyncPlayApi get() = syncPlayApi ?: api.syncPlayApi
@@ -47,9 +48,9 @@ class SyncPlayClockSync(
 
 		for (i in 0 until sampleCount) {
 			try {
-				val t0 = System.currentTimeMillis()
+				val t0 = nowMs()
 				val response = effectiveTimeSyncApi.getUtcTime()
-				val t3 = System.currentTimeMillis()
+				val t3 = nowMs()
 
 				val t1 = localDateTimeToEpochMilli(response.content.requestReceptionTime)
 				val t2 = localDateTimeToEpochMilli(response.content.responseTransmissionTime)
@@ -59,7 +60,7 @@ class SyncPlayClockSync(
 
 				samples.add(SyncSample(rttMs = rtt, offsetMs = offset))
 			} catch (e: Exception) {
-				Timber.w(e, "SyncPlayClockSync: Failed to get time sample #$i")
+				Timber.tag("SyncPlay").w(e, "ClockSync: Failed to get time sample #$i")
 			}
 		}
 
@@ -67,12 +68,12 @@ class SyncPlayClockSync(
 		if (bestSample != null) {
 			_clockOffsetMs.value = bestSample.offsetMs
 			_currentPingMs.value = bestSample.rttMs
-			Timber.i("SyncPlayClockSync: Synchronized with offset=${bestSample.offsetMs}ms, RTT=${bestSample.rttMs}ms")
+			Timber.tag("SyncPlay").i("ClockSync: offset=%dms rtt=%dms", bestSample.offsetMs, bestSample.rttMs)
 
 			try {
 				effectiveSyncPlayApi.syncPlayPing(PingRequestDto(ping = bestSample.rttMs))
 			} catch (e: Exception) {
-				Timber.w(e, "SyncPlayClockSync: Failed to report ping to server")
+				Timber.tag("SyncPlay").w(e, "ClockSync: Failed to report ping to server")
 			}
 		}
 		bestSample
@@ -85,7 +86,7 @@ class SyncPlayClockSync(
 	fun calculateDelayMs(whenUtc: LocalDateTime): Long {
 		val targetServerEpochMs = localDateTimeToEpochMilli(whenUtc)
 		val targetLocalEpochMs = serverToLocalEpochMs(targetServerEpochMs)
-		val currentLocalMs = System.currentTimeMillis()
+		val currentLocalMs = nowMs()
 		return targetLocalEpochMs - currentLocalMs
 	}
 

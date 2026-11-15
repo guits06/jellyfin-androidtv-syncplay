@@ -127,7 +127,7 @@ class SyncPlayLoopPreventionTests : FunSpec({
 
 		integration.executeRemoteCommand(command)
 
-		io.mockk.verify { mockController.pause() }
+		io.mockk.verify { mockController.pauseRemote() }
 		io.mockk.verify { mockManager.isHandlingRemoteCommand = true }
 		io.mockk.verify { mockManager.isHandlingRemoteCommand = false }
 	}
@@ -230,6 +230,6 @@ class SyncPlayLoopPreventionTests : FunSpec({
 		integration.executeRemoteCommand(command)
 
 		io.mockk.coVerify(exactly = 1) { mockManager.getGroup(groupId) }
-		io.mockk.verify(exactly = 1) { mockController.pause() }
+		io.mockk.verify(exactly = 1) { mockController.pauseRemote() }
 	}
 })

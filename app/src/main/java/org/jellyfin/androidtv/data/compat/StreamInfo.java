@@ -71,13 +71,15 @@ public class StreamInfo {
     }
 
     public final org.jellyfin.sdk.model.api.SubtitleDeliveryMethod getSubtitleDeliveryMethod() {
-        if (MediaSource == null) return SubtitleDeliveryMethod.DROP;
+        if (MediaSource == null || MediaSource.getMediaStreams() == null) return SubtitleDeliveryMethod.DROP;
         Integer subtitleStreamIndex = MediaSource.getDefaultSubtitleStreamIndex();
-        if (subtitleStreamIndex == null || subtitleStreamIndex == -1) return SubtitleDeliveryMethod.DROP;
-        if (MediaSource.getMediaStreams() == null || subtitleStreamIndex < 0 || subtitleStreamIndex >= MediaSource.getMediaStreams().size()) {
-            return SubtitleDeliveryMethod.DROP;
+        if (subtitleStreamIndex == null || subtitleStreamIndex < 0) return SubtitleDeliveryMethod.DROP;
+        for (MediaStream stream : MediaSource.getMediaStreams()) {
+            if (stream.getIndex() == subtitleStreamIndex && stream.getType() == MediaStreamType.SUBTITLE) {
+                return stream.getDeliveryMethod() != null ? stream.getDeliveryMethod() : SubtitleDeliveryMethod.DROP;
+            }
         }
-        return MediaSource.getMediaStreams().get(subtitleStreamIndex).getDeliveryMethod();
+        return SubtitleDeliveryMethod.DROP;
     }
 
     private String PlaySessionId;
@@ -100,6 +102,9 @@ public class StreamInfo {
 
     public final ArrayList<org.jellyfin.sdk.model.api.MediaStream> getSelectableStreams(MediaStreamType type) {
         ArrayList<org.jellyfin.sdk.model.api.MediaStream> list = new ArrayList<org.jellyfin.sdk.model.api.MediaStream>();
+        if (getMediaSource() == null || getMediaSource().getMediaStreams() == null) {
+            return list;
+        }
 
         for (org.jellyfin.sdk.model.api.MediaStream stream : getMediaSource().getMediaStreams()) {
             if (type == stream.getType()) {

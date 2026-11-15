@@ -20,6 +20,7 @@ import org.jellyfin.androidtv.ui.playback.PlaybackControllerContainer
 import org.jellyfin.androidtv.util.PlaybackHelper
 import org.jellyfin.sdk.model.api.GroupStateType
 import org.jellyfin.sdk.model.api.PlayQueueUpdate
+import org.jellyfin.sdk.model.api.PlaybackRequestType
 import org.jellyfin.sdk.model.api.SendCommand
 import org.jellyfin.sdk.model.api.SendCommandType
 import timber.log.Timber
@@ -36,20 +37,39 @@ class SyncPlayPlaybackIntegration(
 	private val playbackHelper: PlaybackHelper,
 	private val coroutineScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main),
 	private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main,
+	private val elapsedRealtimeMs: () -> Long = { System.nanoTime() / NANOS_PER_MS },
 ) {
 	val isInGroup: Boolean get() = syncPlayManager.isInGroup.value
+
 	private var lastAnchorPositionTicks: Long = 0L
 	private var lastAnchorLocalTimeMs: Long = 0L
 	private var lastSeekCorrectionTimeMs: Long = 0L
 	private var currentPlaybackSpeed: Float = SPEED_NORMAL
+	private var speedCorrectionAttempted: Boolean = false
+	private var speedCorrectionUnsupported: Boolean = false
 	private var driftJob: Job? = null
+
+	// Explicit state machine fields replacing fragile single-call booleans
+	private var scheduledCommandJob: Job? = null
+	private var internalTransitionCount: Int = 0
+	private var internalTransitionReason: PlaybackTransitionReason = PlaybackTransitionReason.NONE
+	private var pendingPreSwitchPlaying: Boolean? = null
+	private var remoteSuppressionUntilElapsedMs: Long = 0L
+	private var pendingQueueSwitchItemId: UUID? = null
+	private var pendingQueueSwitchUntilElapsedMs: Long = 0L
+	private var hasSentBufferingThisStall: Boolean = false
+	private var lastBufferingSentElapsedMs: Long = 0L
+	private var desiredPlayWhenReady: Boolean? = null
 
 	init {
 		observeCommands()
 		observePlayQueue()
 		observePlaybackSession()
 		observeGroupState()
+		observeReconnects()
 	}
+
+	private fun log(): Timber.Tree = Timber.tag(TAG)
 
 	private fun observeCommands() {
 		syncPlayManager.commands
@@ -74,6 +94,9 @@ class SyncPlayPlaybackIntegration(
 		playbackControllerContainer.playbackControllerFlow
 			.onEach { controller ->
 				if (controller != null) {
+					speedCorrectionAttempted = false
+					speedCorrectionUnsupported = false
+					hasSentBufferingThisStall = false
 					startDriftMonitor()
 				} else {
 					stopDriftMonitor()
@@ -87,138 +110,258 @@ class SyncPlayPlaybackIntegration(
 			.onEach { state ->
 				if (!syncPlayManager.isInGroup.value) return@onEach
 				val controller = playbackControllerContainer.playbackController ?: return@onEach
-				if (syncPlayManager.isHandlingRemoteCommand) return@onEach
+				if (isInternalTransitionActive() || isRemoteCommandSuppressed()) return@onEach
 
 				when (state) {
-					GroupStateType.PLAYING -> {
-						if (!controller.isPlaying) {
-							Timber.i("SyncPlayPlaybackIntegration: Group transitioned to PLAYING, resuming local playback at ${controller.currentPosition}ms")
-							syncPlayManager.isHandlingRemoteCommand = true
-							try {
-								withContext(mainDispatcher) {
-									controller.play(controller.currentPosition)
-								}
-							} finally {
-								syncPlayManager.isHandlingRemoteCommand = false
-							}
-						}
-					}
-
-					GroupStateType.PAUSED -> {
-						if (controller.isPlaying) {
-							Timber.i("SyncPlayPlaybackIntegration: Group transitioned to PAUSED, pausing local player")
-							syncPlayManager.isHandlingRemoteCommand = true
-							try {
-								withContext(mainDispatcher) {
-									controller.pause()
-								}
-							} finally {
-								syncPlayManager.isHandlingRemoteCommand = false
-							}
-						}
-					}
-
+					GroupStateType.PAUSED,
 					GroupStateType.WAITING -> {
-						if (controller.isPlaying) {
-							Timber.i("SyncPlayPlaybackIntegration: Group transitioned to WAITING, pausing local player")
-							syncPlayManager.isHandlingRemoteCommand = true
-							try {
-								withContext(mainDispatcher) {
-									controller.pause()
-								}
-							} finally {
-								syncPlayManager.isHandlingRemoteCommand = false
+						desiredPlayWhenReady = false
+						if (controller.isPlaying && scheduledCommandJob?.isActive != true) {
+							log().i("Group state -> %s while locally playing; pausing locally", state)
+							suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
+							withContext(mainDispatcher) {
+								controller.pauseRemote()
 							}
 						}
+					}
+
+					GroupStateType.PLAYING -> {
+						// Do NOT unpause here: UNPAUSE SendCommand schedules exact playback start at `When`.
+						desiredPlayWhenReady = true
 					}
 
 					GroupStateType.IDLE -> {
-						// Group is idle, do nothing
+						desiredPlayWhenReady = false
 					}
 				}
 			}
 			.launchIn(coroutineScope)
 	}
 
+	private fun observeReconnects() {
+		syncPlayManager.reconnected
+			.onEach {
+				val controller = playbackControllerContainer.playbackController ?: return@onEach
+				if (!syncPlayManager.isInGroup.value) return@onEach
+
+				val groupState = syncPlayManager.groupState.value
+				val positionTicks = controller.currentPosition * TICKS_PER_MS
+				val playlistItemId = getCurrentPlaylistItemId()
+				log().i("Reconnect resync: groupState=%s pos=%dms", groupState, controller.currentPosition)
+				when (groupState) {
+					GroupStateType.PAUSED,
+					GroupStateType.WAITING -> {
+						if (controller.isPlaying) {
+							suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
+							withContext(mainDispatcher) {
+								controller.pauseRemote()
+							}
+						}
+						if (playlistItemId != null) {
+							syncPlayManager.sendReady(positionTicks, false, playlistItemId)
+						}
+					}
+
+					GroupStateType.PLAYING -> {
+						if (playlistItemId != null) {
+							syncPlayManager.sendReady(positionTicks, controller.isPlaying, playlistItemId)
+						}
+					}
+
+					GroupStateType.IDLE -> Unit
+				}
+			}
+			.launchIn(coroutineScope)
+	}
+
+	/**
+	 * Marks the start of an internal player rebuild/track switch so ExoPlayer
+	 * teardown/seek/buffer callbacks never leak as local user SyncPlay commands.
+	 */
+	fun beginInternalTransition(
+		reason: PlaybackTransitionReason,
+		wasPlaying: Boolean? = null,
+	) {
+		internalTransitionCount++
+		internalTransitionReason = reason
+		if (wasPlaying != null) {
+			pendingPreSwitchPlaying = wasPlaying
+		}
+		log().i("beginInternalTransition reason=%s depth=%d wasPlaying=%s", reason, internalTransitionCount, wasPlaying)
+	}
+
+	fun endInternalTransition() {
+		if (internalTransitionCount > 0) {
+			internalTransitionCount--
+		}
+		if (internalTransitionCount == 0) {
+			internalTransitionReason = PlaybackTransitionReason.NONE
+			pendingPreSwitchPlaying = null
+		}
+		log().i("endInternalTransition depth=%d", internalTransitionCount)
+	}
+
+	fun isInternalTransitionActive(): Boolean = internalTransitionCount > 0
+
+	/**
+	 * Tells PlaybackController whether initial stream start should hold paused
+	 * rather than auto-playing immediately.
+	 */
+	fun shouldStartPaused(): Boolean {
+		if (!syncPlayManager.isInGroup.value) return false
+		val state = syncPlayManager.groupState.value
+		if (state == GroupStateType.PAUSED || state == GroupStateType.WAITING || state == GroupStateType.IDLE) {
+			return true
+		}
+		return desiredPlayWhenReady == false
+	}
+
+	private fun isRemoteCommandSuppressed(): Boolean =
+		syncPlayManager.isHandlingRemoteCommand || elapsedRealtimeMs() < remoteSuppressionUntilElapsedMs
+
+	private fun isUserActionBlocked(
+		origin: SyncPlayEventOrigin,
+		ignoreAsyncSuppressionWindow: Boolean = false,
+	): Boolean {
+		if (!syncPlayManager.isInGroup.value) return true
+		return when (origin) {
+			SyncPlayEventOrigin.REMOTE_SYNCPLAY,
+			SyncPlayEventOrigin.INTERNAL_PLAYER_TRANSITION -> true
+
+			SyncPlayEventOrigin.USER_LOCAL -> {
+				val suppressed = if (ignoreAsyncSuppressionWindow) {
+					syncPlayManager.isHandlingRemoteCommand
+				} else {
+					isRemoteCommandSuppressed()
+				}
+				isInternalTransitionActive() || suppressed
+			}
+		}
+	}
+
+	private fun suppressRemoteSideEffectsFor(durationMs: Long) {
+		val target = elapsedRealtimeMs() + durationMs
+		if (target > remoteSuppressionUntilElapsedMs) {
+			remoteSuppressionUntilElapsedMs = target
+		}
+	}
+
 	@Suppress("LongMethod", "CyclomaticComplexMethod", "MagicNumber")
 	internal fun executeRemoteCommand(command: SendCommand) {
-		coroutineScope.launch {
+		scheduledCommandJob?.cancel()
+		scheduledCommandJob = coroutineScope.launch {
 			var currentGroup = syncPlayManager.currentGroup.value
 			if (currentGroup == null) {
-				Timber.i("SyncPlayPlaybackIntegration: Received command ${command.command} but currentGroup is null. Fetching group ${command.groupId}")
+				log().i("Received command %s without cached group; fetching %s", command.command, command.groupId)
 				syncPlayManager.getGroup(command.groupId)
 				currentGroup = syncPlayManager.currentGroup.value
 			}
 
 			if (currentGroup == null || command.groupId != currentGroup.groupId) {
-				Timber.d("SyncPlayPlaybackIntegration: Ignoring command for different group ${command.groupId}")
+				log().d("Ignoring command for non-active group %s", command.groupId)
 				return@launch
 			}
 
-			val delayMs = clockSync.calculateDelayMs(command.`when`)
-			if (delayMs > 0) {
-				delay(delayMs)
+			val rawDelayMs = clockSync.calculateDelayMs(command.`when`)
+			val targetTicks = command.positionTicks ?: 0L
+			val rawTargetMs = targetTicks / TICKS_PER_MS
+
+			// Pre-seek while paused during wait window for smoother UNPAUSE frame readiness
+			if (command.command == SendCommandType.UNPAUSE && rawDelayMs > PRE_SEEK_MIN_DELAY_MS) {
+				val preSeekController = playbackControllerContainer.playbackController
+				if (preSeekController != null) {
+					suppressRemoteSideEffectsFor(rawDelayMs + ASYNC_PLAYER_SUPPRESSION_MS)
+					withContext(mainDispatcher) {
+						preSeekController.pauseRemote()
+						if (abs(preSeekController.currentPosition - rawTargetMs) > PRE_SEEK_TOLERANCE_MS) {
+							preSeekController.seekRemote(rawTargetMs, false)
+						}
+					}
+				}
+			}
+
+			if (rawDelayMs > 0) {
+				delay(rawDelayMs)
 			}
 
 			val controller = playbackControllerContainer.playbackController
 			if (controller == null) {
-				Timber.w("SyncPlayPlaybackIntegration: No active PlaybackController to apply command ${command.command}")
+				log().w("No active PlaybackController to execute remote %s", command.command)
 				return@launch
 			}
 
 			syncPlayManager.isHandlingRemoteCommand = true
+			suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
 			try {
 				withContext(mainDispatcher) {
 					when (command.command) {
 						SendCommandType.PAUSE -> {
-							Timber.i("SyncPlayPlaybackIntegration: Applying remote PAUSE")
-							controller.pause()
+							desiredPlayWhenReady = false
+							lastAnchorLocalTimeMs = 0L
+							if (command.positionTicks != null) {
+								lastAnchorPositionTicks = command.positionTicks!!
+							}
+							log().i("Applying remote PAUSE at %dms", rawTargetMs)
+							controller.pauseRemote()
+							if (command.positionTicks != null &&
+								abs(controller.currentPosition - rawTargetMs) > PAUSED_SEEK_TOLERANCE_MS
+							) {
+								controller.seekRemote(rawTargetMs, false)
+							}
 						}
 
 						SendCommandType.UNPAUSE -> {
-							val elapsedMs = maxOf(0L, -delayMs)
+							desiredPlayWhenReady = true
+							val elapsedMs = maxOf(0L, -rawDelayMs)
 							val baseTicks = command.positionTicks ?: (controller.currentPosition * TICKS_PER_MS)
 							val targetPosMs = (baseTicks / TICKS_PER_MS) + elapsedMs
-							Timber.i("SyncPlayPlaybackIntegration: Applying remote UNPAUSE at ${targetPosMs}ms")
+							log().i("Applying remote UNPAUSE at %dms (delay=%dms)", targetPosMs, rawDelayMs)
 
 							lastAnchorPositionTicks = targetPosMs * TICKS_PER_MS
-							lastAnchorLocalTimeMs = System.currentTimeMillis()
-							lastSeekCorrectionTimeMs = System.currentTimeMillis()
-							if (currentPlaybackSpeed != SPEED_NORMAL) {
-								currentPlaybackSpeed = SPEED_NORMAL
-								controller.setPlaybackSpeed(SPEED_NORMAL)
-							}
+							lastAnchorLocalTimeMs = elapsedRealtimeMs()
+							lastSeekCorrectionTimeMs = lastAnchorLocalTimeMs
+							hasSentBufferingThisStall = false
+							resetPlaybackSpeedIfNeeded(controller)
 
-							if (abs(controller.currentPosition - targetPosMs) > 1500L) {
-								controller.seek(targetPosMs)
+							if (abs(controller.currentPosition - targetPosMs) > UNPAUSE_SEEK_TOLERANCE_MS) {
+								controller.seekRemote(targetPosMs, true)
+							} else {
+								controller.playRemote(targetPosMs)
 							}
-							controller.play(targetPosMs)
 						}
 
 						SendCommandType.SEEK -> {
-							val targetPosMs = (command.positionTicks ?: 0L) / TICKS_PER_MS
-							Timber.i("SyncPlayPlaybackIntegration: Applying remote SEEK to ${targetPosMs}ms")
-
-							lastAnchorPositionTicks = targetPosMs * TICKS_PER_MS
-							lastAnchorLocalTimeMs = System.currentTimeMillis()
-							lastSeekCorrectionTimeMs = System.currentTimeMillis()
-							if (currentPlaybackSpeed != SPEED_NORMAL) {
-								currentPlaybackSpeed = SPEED_NORMAL
-								controller.setPlaybackSpeed(SPEED_NORMAL)
-							}
-
-							controller.seek(targetPosMs)
+							// After Seek, Jellyfin server moves group to WAITING until all Ready -> Unpause/Pause.
+							desiredPlayWhenReady = false
+							lastAnchorPositionTicks = rawTargetMs * TICKS_PER_MS
+							lastAnchorLocalTimeMs = 0L
+							lastSeekCorrectionTimeMs = elapsedRealtimeMs()
+							hasSentBufferingThisStall = false
+							resetPlaybackSpeedIfNeeded(controller)
+							log().i("Applying remote SEEK to %dms (awaiting Ready -> Unpause/Pause)", rawTargetMs)
+							controller.seekRemote(rawTargetMs, false)
 						}
 
 						SendCommandType.STOP -> {
-							Timber.i("SyncPlayPlaybackIntegration: Applying remote STOP")
-							controller.stop()
+							desiredPlayWhenReady = false
+							lastAnchorPositionTicks = 0L
+							lastAnchorLocalTimeMs = 0L
+							pendingQueueSwitchItemId = null
+							log().i("Applying remote STOP")
+							controller.stopRemote()
 						}
 					}
 				}
 			} finally {
 				syncPlayManager.isHandlingRemoteCommand = false
 			}
+		}
+	}
+
+	private fun resetPlaybackSpeedIfNeeded(controller: PlaybackController) {
+		if (currentPlaybackSpeed != SPEED_NORMAL) {
+			currentPlaybackSpeed = SPEED_NORMAL
+			controller.setPlaybackSpeed(SPEED_NORMAL)
 		}
 	}
 
@@ -229,14 +372,18 @@ class SyncPlayPlaybackIntegration(
 		val controller = playbackControllerContainer.playbackController
 		val playingItem = controller?.currentlyPlayingItem
 
+		desiredPlayWhenReady = playQueue.isPlaying
+
 		if (playingItem == null || playingItem.id != currentItem.itemId) {
-			Timber.i("SyncPlayPlaybackIntegration: Switching to playlist item ${currentItem.itemId} (index ${playQueue.playingItemIndex})")
+			log().i("PlayQueue switching item to %s (index=%d startTicks=%d)", currentItem.itemId, playQueue.playingItemIndex, playQueue.startPositionTicks)
+			pendingQueueSwitchItemId = playingItem?.id
+			pendingQueueSwitchUntilElapsedMs = elapsedRealtimeMs() + QUEUE_SWITCH_SUPPRESSION_MS
+			suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
 			coroutineScope.launch(mainDispatcher) {
-				val startPositionTicks = playQueue.startPositionTicks
 				playbackHelper.retrieveAndPlay(
 					listOf(currentItem.itemId),
 					false,
-					startPositionTicks,
+					playQueue.startPositionTicks,
 					0,
 					context,
 				)
@@ -250,7 +397,11 @@ class SyncPlayPlaybackIntegration(
 			while (isActive) {
 				delay(DRIFT_CHECK_INTERVAL_MS)
 				val controller = playbackControllerContainer.playbackController
-				if (controller != null && controller.isPlaying && syncPlayManager.isInGroup.value) {
+				if (controller != null &&
+					controller.isPlaying &&
+					syncPlayManager.isInGroup.value &&
+					!isInternalTransitionActive()
+				) {
 					checkAndCorrectDrift(controller)
 				}
 			}
@@ -264,51 +415,64 @@ class SyncPlayPlaybackIntegration(
 		lastAnchorLocalTimeMs = 0L
 		lastSeekCorrectionTimeMs = 0L
 		currentPlaybackSpeed = SPEED_NORMAL
+		speedCorrectionAttempted = false
+		speedCorrectionUnsupported = false
 	}
 
-	private fun checkAndCorrectDrift(controller: PlaybackController) {
+	internal fun checkAndCorrectDrift(controller: PlaybackController) {
 		if (syncPlayManager.groupState.value != GroupStateType.PLAYING) return
+		if (desiredPlayWhenReady != true) return
 		if (!controller.isPlaying) return
 		if (lastAnchorLocalTimeMs == 0L) return
 
-		val now = System.currentTimeMillis()
+		val now = elapsedRealtimeMs()
 		if (now - lastSeekCorrectionTimeMs < DRIFT_SEEK_COOLDOWN_MS) return
 
-		val elapsedLocalMs = now - lastAnchorLocalTimeMs
-		val expectedTicks = lastAnchorPositionTicks + (elapsedLocalMs * TICKS_PER_MS)
-		val actualTicks = controller.currentPosition * TICKS_PER_MS
-		val diffMs = (actualTicks - expectedTicks) / TICKS_PER_MS
+		val expectedPosMs = computeExpectedPositionMs(now)
+		val actualPosMs = controller.currentPosition
+		val diffMs = actualPosMs - expectedPosMs
 
 		if (abs(diffMs) > DRIFT_SEEK_THRESHOLD_MS) {
-			Timber.i("SyncPlayPlaybackIntegration: Large drift of $diffMs ms detected, performing seek correction")
+			log().i("Drift %dms exceeds seek threshold -> seeking to %dms", diffMs, expectedPosMs)
 			lastSeekCorrectionTimeMs = now
+			suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
 			syncPlayManager.isHandlingRemoteCommand = true
 			try {
-				val targetPosMs = expectedTicks / TICKS_PER_MS
-				controller.seek(targetPosMs)
-				lastAnchorPositionTicks = targetPosMs * TICKS_PER_MS
-				lastAnchorLocalTimeMs = System.currentTimeMillis()
-				if (currentPlaybackSpeed != SPEED_NORMAL) {
-					currentPlaybackSpeed = SPEED_NORMAL
-					controller.setPlaybackSpeed(SPEED_NORMAL)
-				}
+				controller.seekRemote(expectedPosMs, true)
+				lastAnchorPositionTicks = expectedPosMs * TICKS_PER_MS
+				lastAnchorLocalTimeMs = now
+				resetPlaybackSpeedIfNeeded(controller)
 			} finally {
 				syncPlayManager.isHandlingRemoteCommand = false
 			}
-		} else if (abs(diffMs) > DRIFT_SPEED_THRESHOLD_MS) {
+		} else if (!speedCorrectionUnsupported && abs(diffMs) > DRIFT_SPEED_THRESHOLD_MS) {
 			val targetSpeed = if (diffMs > 0) SPEED_SLOW_DOWN else SPEED_SPEED_UP
+			// Detect whether ExoPlayer actually honored a prior speed adjustment (e.g. audio offload/passthrough ignores speed)
+			if (speedCorrectionAttempted && currentPlaybackSpeed != SPEED_NORMAL &&
+				abs(controller.playbackSpeed - SPEED_NORMAL) < 0.01f
+			) {
+				log().i("Playback speed control unsupported by current audio pipeline; disabling speed nudging for stream")
+				speedCorrectionUnsupported = true
+				currentPlaybackSpeed = SPEED_NORMAL
+				controller.setPlaybackSpeed(SPEED_NORMAL)
+				return
+			}
 			if (currentPlaybackSpeed != targetSpeed) {
 				currentPlaybackSpeed = targetSpeed
-				Timber.d("SyncPlayPlaybackIntegration: Minor drift of $diffMs ms, adjusting speed to $targetSpeed")
+				speedCorrectionAttempted = true
+				log().d("Minor drift %dms -> setting speed %.2f", diffMs, targetSpeed)
 				controller.setPlaybackSpeed(targetSpeed)
 			}
 		} else if (abs(diffMs) < DRIFT_SPEED_RESTORE_THRESHOLD_MS) {
 			if (currentPlaybackSpeed != SPEED_NORMAL) {
-				currentPlaybackSpeed = SPEED_NORMAL
-				Timber.d("SyncPlayPlaybackIntegration: Drift resolved, restoring normal speed")
-				controller.setPlaybackSpeed(SPEED_NORMAL)
+				resetPlaybackSpeedIfNeeded(controller)
 			}
 		}
+	}
+
+	private fun computeExpectedPositionMs(nowElapsedMs: Long = elapsedRealtimeMs()): Long {
+		val elapsedLocalMs = maxOf(0L, nowElapsedMs - lastAnchorLocalTimeMs)
+		return (lastAnchorPositionTicks / TICKS_PER_MS) + elapsedLocalMs
 	}
 
 	fun getCurrentPlaylistItemId(): UUID? {
@@ -323,144 +487,259 @@ class SyncPlayPlaybackIntegration(
 		return queue.playlist.getOrNull(index)?.playlistItemId
 	}
 
+	@JvmOverloads
 	fun onUserStartPlayback(
 		itemIds: List<UUID>,
 		playingItemIndex: Int,
 		startPositionTicks: Long,
+		origin: SyncPlayEventOrigin = SyncPlayEventOrigin.USER_LOCAL,
 	) {
-		if (syncPlayManager.isInGroup.value && !syncPlayManager.isHandlingRemoteCommand) {
-			val currentQueue = syncPlayManager.playQueue.value
-			val currentPlayingItem = currentQueue?.playlist?.getOrNull(currentQueue.playingItemIndex)
-			val targetItemId = itemIds.getOrNull(playingItemIndex)
-			if (currentPlayingItem?.itemId == targetItemId) {
-				Timber.d("SyncPlayPlaybackIntegration: Item $targetItemId already active in SyncPlay queue, skipping setNewQueue")
-				return
-			}
-			coroutineScope.launch {
-				Timber.i("SyncPlayPlaybackIntegration: Sending setNewQueue with ${itemIds.size} items, index $playingItemIndex")
-				syncPlayManager.setNewQueue(itemIds, playingItemIndex, startPositionTicks)
-			}
+		if (isUserActionBlocked(origin, ignoreAsyncSuppressionWindow = true)) {
+			log().d("Blocked onUserStartPlayback (origin=%s, internal=%s)", origin, internalTransitionReason)
+			return
+		}
+		val currentQueue = syncPlayManager.playQueue.value
+		val currentPlayingItem = currentQueue?.playlist?.getOrNull(currentQueue.playingItemIndex)
+		val targetItemId = itemIds.getOrNull(playingItemIndex)
+		if (currentPlayingItem?.itemId == targetItemId) {
+			log().d("Item %s already active in SyncPlay queue, skipping setNewQueue", targetItemId)
+			return
+		}
+		coroutineScope.launch {
+			log().i("Sending setNewQueue (%d items, index=%d, startTicks=%d)", itemIds.size, playingItemIndex, startPositionTicks)
+			syncPlayManager.setNewQueue(itemIds, playingItemIndex, startPositionTicks)
 		}
 	}
 
-	fun onUserPause() {
-		if (syncPlayManager.isInGroup.value && !syncPlayManager.isHandlingRemoteCommand) {
-			coroutineScope.launch {
-				syncPlayManager.sendPause()
-			}
+	@JvmOverloads
+	fun onUserPause(origin: SyncPlayEventOrigin = SyncPlayEventOrigin.USER_LOCAL) {
+		if (isUserActionBlocked(origin)) return
+		desiredPlayWhenReady = false
+		coroutineScope.launch {
+			log().i("User local PAUSE -> sending /SyncPlay/Pause")
+			syncPlayManager.sendPause()
 		}
 	}
 
-	fun onUserPlay() {
-		if (syncPlayManager.isInGroup.value && !syncPlayManager.isHandlingRemoteCommand) {
-			coroutineScope.launch {
-				syncPlayManager.sendUnpause()
-			}
+	@JvmOverloads
+	fun onUserPlay(origin: SyncPlayEventOrigin = SyncPlayEventOrigin.USER_LOCAL) {
+		if (isUserActionBlocked(origin)) return
+		desiredPlayWhenReady = true
+		coroutineScope.launch {
+			log().i("User local PLAY -> sending /SyncPlay/Unpause")
+			syncPlayManager.sendUnpause()
 		}
 	}
 
-	fun onUserSeek(positionMs: Long) {
-		if (syncPlayManager.isInGroup.value && !syncPlayManager.isHandlingRemoteCommand) {
-			coroutineScope.launch {
-				syncPlayManager.sendSeek(positionMs * TICKS_PER_MS)
-			}
+	@JvmOverloads
+	fun onUserSeek(positionMs: Long, origin: SyncPlayEventOrigin = SyncPlayEventOrigin.USER_LOCAL) {
+		if (isUserActionBlocked(origin)) return
+		coroutineScope.launch {
+			log().i("User local SEEK -> %dms", positionMs)
+			syncPlayManager.sendSeek(positionMs * TICKS_PER_MS)
 		}
 	}
 
-	fun onUserStop() {
-		if (syncPlayManager.isInGroup.value && !syncPlayManager.isHandlingRemoteCommand) {
-			coroutineScope.launch {
-				syncPlayManager.sendStop()
-			}
+	@JvmOverloads
+	fun onUserStop(origin: SyncPlayEventOrigin = SyncPlayEventOrigin.USER_LOCAL) {
+		val currentControllerItemId = playbackControllerContainer.playbackController?.currentlyPlayingItem?.id
+		if (pendingQueueSwitchItemId != null &&
+			elapsedRealtimeMs() < pendingQueueSwitchUntilElapsedMs &&
+			(currentControllerItemId == null || currentControllerItemId == pendingQueueSwitchItemId)
+		) {
+			log().i("Ignoring tear-down stop for item %s during SyncPlay queue switch", currentControllerItemId)
+			pendingQueueSwitchItemId = null
+			return
+		}
+		if (isUserActionBlocked(origin)) return
+		desiredPlayWhenReady = false
+		coroutineScope.launch {
+			log().i("User local STOP -> sending /SyncPlay/Stop")
+			syncPlayManager.sendStop()
 		}
 	}
 
 	fun onUserNext() {
-		if (syncPlayManager.isInGroup.value && !syncPlayManager.isHandlingRemoteCommand) {
-			val playlistItemId = getCurrentPlaylistItemId() ?: return
-			coroutineScope.launch {
-				syncPlayManager.nextItem(playlistItemId)
-			}
+		if (isUserActionBlocked(SyncPlayEventOrigin.USER_LOCAL)) return
+		val playlistItemId = getCurrentPlaylistItemId() ?: return
+		coroutineScope.launch {
+			log().i("User NEXT -> playlistItemId=%s", playlistItemId)
+			syncPlayManager.nextItem(playlistItemId)
 		}
 	}
 
 	fun onUserPrevious() {
-		if (syncPlayManager.isInGroup.value && !syncPlayManager.isHandlingRemoteCommand) {
-			val playlistItemId = getCurrentPlaylistItemId() ?: return
-			coroutineScope.launch {
-				syncPlayManager.previousItem(playlistItemId)
-			}
+		if (isUserActionBlocked(SyncPlayEventOrigin.USER_LOCAL)) return
+		val playlistItemId = getCurrentPlaylistItemId() ?: return
+		coroutineScope.launch {
+			log().i("User PREVIOUS -> playlistItemId=%s", playlistItemId)
+			syncPlayManager.previousItem(playlistItemId)
 		}
 	}
 
+	/**
+	 * Called only when mid-playback network stalling occurs AFTER the stream was already prepared.
+	 * Track switches, burn-in rebuilds, and remote seeks suppress spurious Buffering pings.
+	 */
 	fun onPlayerBuffering() {
-		if (syncPlayManager.isInGroup.value) {
-			val playlistItemId = getCurrentPlaylistItemId() ?: return
-			val controller = playbackControllerContainer.playbackController
-			val positionTicks = (controller?.currentPosition ?: 0L) * TICKS_PER_MS
-			val isPlaying = controller?.isPlaying ?: false
+		if (!syncPlayManager.isInGroup.value) return
+		if (isInternalTransitionActive() || isRemoteCommandSuppressed()) {
+			log().d("Ignoring buffering during transition/suppression")
+			return
+		}
+		if (syncPlayManager.groupState.value != GroupStateType.PLAYING) {
+			// Avoid repeatedly nudging Waiting/Paused group deadlines on decoder stalls
+			return
+		}
+		val now = elapsedRealtimeMs()
+		if (hasSentBufferingThisStall || now - lastBufferingSentElapsedMs < BUFFERING_DEBOUNCE_MS) return
 
-			coroutineScope.launch {
-				syncPlayManager.sendBuffering(positionTicks, isPlaying, playlistItemId)
-			}
+		val playlistItemId = getCurrentPlaylistItemId() ?: return
+		val controller = playbackControllerContainer.playbackController ?: return
+		val positionTicks = controller.currentPosition * TICKS_PER_MS
+		hasSentBufferingThisStall = true
+		lastBufferingSentElapsedMs = now
+
+		coroutineScope.launch {
+			log().i("Mid-playback buffering at %dms -> /SyncPlay/Buffering", controller.currentPosition)
+			syncPlayManager.sendBuffering(positionTicks, false, playlistItemId)
+		}
+	}
+
+	fun onPlayerBufferingEnded() {
+		if (!syncPlayManager.isInGroup.value) return
+		if (!hasSentBufferingThisStall) return
+		hasSentBufferingThisStall = false
+		if (isInternalTransitionActive()) return
+
+		val controller = playbackControllerContainer.playbackController ?: return
+		val playlistItemId = getCurrentPlaylistItemId() ?: return
+		val positionTicks = controller.currentPosition * TICKS_PER_MS
+		coroutineScope.launch {
+			log().i("Recovered from stall at %dms -> /SyncPlay/Ready", controller.currentPosition)
+			syncPlayManager.sendReady(positionTicks, controller.isPlaying, playlistItemId)
 		}
 	}
 
 	fun onPlayerPrepared() {
-		if (syncPlayManager.isInGroup.value) {
-			val controller = playbackControllerContainer.playbackController
-			val positionTicks = (controller?.currentPosition ?: 0L) * TICKS_PER_MS
+		val controller = playbackControllerContainer.playbackController
+		onStreamReady(
+			positionMs = controller?.currentPosition ?: 0L,
+			isPlaying = controller?.isPlaying ?: false,
+		)
+	}
 
-			lastAnchorPositionTicks = positionTicks
-			lastAnchorLocalTimeMs = System.currentTimeMillis()
-			lastSeekCorrectionTimeMs = System.currentTimeMillis()
-			if (currentPlaybackSpeed != SPEED_NORMAL) {
-				currentPlaybackSpeed = SPEED_NORMAL
-				controller?.setPlaybackSpeed(SPEED_NORMAL)
-			}
+	fun onStreamReady(positionMs: Long, isPlaying: Boolean) {
+		val wasInternalTransition = isInternalTransitionActive()
+		val previousReason = internalTransitionReason
+		val wasPlayingBeforeSwitch = pendingPreSwitchPlaying
 
-			val shouldPause = syncPlayManager.groupState.value == GroupStateType.PAUSED ||
-				syncPlayManager.groupState.value == GroupStateType.WAITING
+		if (wasInternalTransition) {
+			endInternalTransition()
+		}
 
-			if (shouldPause) {
-				Timber.i("SyncPlayPlaybackIntegration: Group is ${syncPlayManager.groupState.value}, pausing local player upon prepare")
-				syncPlayManager.isHandlingRemoteCommand = true
-				try {
-					controller?.pause()
-				} finally {
-					syncPlayManager.isHandlingRemoteCommand = false
+		if (!syncPlayManager.isInGroup.value) return
+		val controller = playbackControllerContainer.playbackController
+
+		resetPlaybackSpeedIfNeededIfPresent(controller)
+		lastSeekCorrectionTimeMs = elapsedRealtimeMs()
+
+		if (wasInternalTransition &&
+			(previousReason == PlaybackTransitionReason.TRACK_SWITCH || previousReason == PlaybackTransitionReason.BURN_IN_REBUILD)
+		) {
+			log().i(
+				"Internal %s complete at %dms (groupState=%s wasPlayingBefore=%s)",
+				previousReason,
+				positionMs,
+				syncPlayManager.groupState.value,
+				wasPlayingBeforeSwitch,
+			)
+			val groupState = syncPlayManager.groupState.value
+			if (groupState == GroupStateType.PAUSED || groupState == GroupStateType.WAITING || desiredPlayWhenReady == false) {
+				desiredPlayWhenReady = false
+				suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
+				if (controller != null && controller.isPlaying) {
+					controller.pauseRemote()
+				}
+			} else if (groupState == GroupStateType.PLAYING && lastAnchorLocalTimeMs > 0L && controller != null) {
+				val expectedPosMs = computeExpectedPositionMs()
+				if (abs(controller.currentPosition - expectedPosMs) > REBUILD_CATCHUP_THRESHOLD_MS) {
+					log().i("Catching up after %s from %dms to live anchor %dms", previousReason, controller.currentPosition, expectedPosMs)
+					suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
+					controller.seekRemote(expectedPosMs, true)
+				} else if (!controller.isPlaying) {
+					suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
+					controller.playRemote(expectedPosMs)
 				}
 			}
+			return
+		}
 
-			val isPlaying = if (shouldPause) false else (controller?.isPlaying ?: false)
+		val shouldPause = shouldStartPaused()
+		var effectiveIsPlaying = isPlaying
 
-			coroutineScope.launch {
-				var playlistItemId = getCurrentPlaylistItemId()
-				if (playlistItemId == null) {
-					withTimeoutOrNull(2000.milliseconds) {
-						syncPlayManager.playQueue.first { it != null && it.playlist.isNotEmpty() }
-					}
-					playlistItemId = getCurrentPlaylistItemId()
+		if (shouldPause && controller != null) {
+			log().i("Group state is %s on stream ready; enforcing paused state", syncPlayManager.groupState.value)
+			suppressRemoteSideEffectsFor(ASYNC_PLAYER_SUPPRESSION_MS)
+			syncPlayManager.isHandlingRemoteCommand = true
+			try {
+				controller.pauseRemote()
+			} finally {
+				syncPlayManager.isHandlingRemoteCommand = false
+			}
+			effectiveIsPlaying = false
+		}
+
+		val positionTicks = positionMs * TICKS_PER_MS
+		lastAnchorPositionTicks = positionTicks
+		lastAnchorLocalTimeMs = if (effectiveIsPlaying) elapsedRealtimeMs() else 0L
+		hasSentBufferingThisStall = false
+
+		coroutineScope.launch {
+			var playlistItemId = getCurrentPlaylistItemId()
+			if (playlistItemId == null) {
+				withTimeoutOrNull(2000.milliseconds) {
+					syncPlayManager.playQueue.first { it != null && it.playlist.isNotEmpty() }
 				}
+				playlistItemId = getCurrentPlaylistItemId()
+			}
 
-				if (playlistItemId != null) {
-					syncPlayManager.sendReady(positionTicks, isPlaying, playlistItemId)
-				} else {
-					Timber.w("SyncPlayPlaybackIntegration: Ready not sent, no valid playlistItemId found")
-				}
+			if (playlistItemId != null) {
+				log().i("Sending /SyncPlay/Ready pos=%dms isPlaying=%s item=%s", positionMs, effectiveIsPlaying, playlistItemId)
+				syncPlayManager.sendReady(positionTicks, effectiveIsPlaying, playlistItemId)
+			} else {
+				log().w("Ready not sent: no valid playlistItemId resolved")
 			}
 		}
 	}
 
+	private fun resetPlaybackSpeedIfNeededIfPresent(controller: PlaybackController?) {
+		if (controller != null && currentPlaybackSpeed != SPEED_NORMAL) {
+			currentPlaybackSpeed = SPEED_NORMAL
+			controller.setPlaybackSpeed(SPEED_NORMAL)
+		}
+	}
+
 	companion object {
+		private const val TAG = "SyncPlay"
+		private const val NANOS_PER_MS = 1_000_000L
 		const val TICKS_PER_MS = 10000L
 		const val DRIFT_CHECK_INTERVAL_MS = 3000L
-		const val DRIFT_SEEK_THRESHOLD_MS = 3500L
+		const val DRIFT_SEEK_THRESHOLD_MS = 3000L
 		const val DRIFT_SEEK_COOLDOWN_MS = 8000L
 		const val DRIFT_SPEED_THRESHOLD_MS = 600L
 		const val DRIFT_SPEED_RESTORE_THRESHOLD_MS = 200L
 		const val SPEED_SLOW_DOWN = 0.96f
 		const val SPEED_SPEED_UP = 1.04f
 		const val SPEED_NORMAL = 1.0f
+
+		const val ASYNC_PLAYER_SUPPRESSION_MS = 1500L
+		const val QUEUE_SWITCH_SUPPRESSION_MS = 5000L
+		const val PRE_SEEK_MIN_DELAY_MS = 80L
+		const val PRE_SEEK_TOLERANCE_MS = 500L
+		const val UNPAUSE_SEEK_TOLERANCE_MS = 1200L
+		const val PAUSED_SEEK_TOLERANCE_MS = 1500L
+		const val REBUILD_CATCHUP_THRESHOLD_MS = 1000L
+		const val BUFFERING_DEBOUNCE_MS = 1000L
 	}
 }

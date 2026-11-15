@@ -23,6 +23,8 @@ import org.jellyfin.androidtv.preference.constant.NextUpBehavior;
 import org.jellyfin.androidtv.preference.constant.RefreshRateSwitchingBehavior;
 import org.jellyfin.androidtv.preference.constant.StillWatchingBehavior;
 import org.jellyfin.androidtv.preference.constant.ZoomMode;
+import org.jellyfin.androidtv.syncplay.PlaybackTransitionReason;
+import org.jellyfin.androidtv.syncplay.SyncPlayEventOrigin;
 import org.jellyfin.androidtv.syncplay.SyncPlayPlaybackIntegration;
 import org.jellyfin.androidtv.ui.InteractionTrackerViewModel;
 import org.jellyfin.androidtv.ui.livetv.TvManager;
@@ -136,6 +138,12 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     private long mSeekPosition = -1;
     private boolean wasSeeking = false;
     private boolean finishedInitialSeek = false;
+    private boolean hasPreparedCurrentStream = false;
+    private boolean preserveAudioIndexForRebuild = false;
+    private boolean pendingAutoPlayOnStart = true;
+    private boolean activeStreamShouldStartPaused = false;
+    private boolean awaitingInitialSeekForSyncPlay = false;
+    private final Runnable endInternalTrackSwitchRunnable = () -> syncPlayIntegration.getValue().endInternalTransition();
 
     private LocalDateTime mCurrentProgramEnd = null;
     private LocalDateTime mCurrentProgramStart = null;
@@ -220,6 +228,9 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             return mCurrentStreamInfo.getMediaSource();
         } else {
             BaseItemDto item = getCurrentlyPlayingItem();
+            if (item == null) {
+                return null;
+            }
             List<MediaSourceInfo> mediaSources = item.getMediaSources();
 
             if (mediaSources == null || mediaSources.isEmpty()) {
@@ -425,12 +436,21 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     }
 
     public void play(long position) {
-        play(position, null);
+        play(position, null, SyncPlayEventOrigin.USER_LOCAL);
+    }
+
+    public void playRemote(long position) {
+        play(position, null, SyncPlayEventOrigin.REMOTE_SYNCPLAY);
     }
 
     protected void play(long position, @Nullable Integer forcedSubtitleIndex) {
+        play(position, forcedSubtitleIndex, SyncPlayEventOrigin.USER_LOCAL);
+    }
+
+    protected void play(long position, @Nullable Integer forcedSubtitleIndex, SyncPlayEventOrigin origin) {
         String forcedAudioLanguage = videoQueueManager.getValue().getLastPlayedAudioLanguageIsoCode();
-        Timber.i("Play called from state: %s with pos: %d, sub index: %d and forced audio: %s", mPlaybackState, position, forcedSubtitleIndex, forcedAudioLanguage);
+        Timber.i("Play called from state: %s with pos: %d, sub index: %d, forced audio: %s, origin: %s",
+                mPlaybackState, position, forcedSubtitleIndex, forcedAudioLanguage, origin);
 
         if (mFragment == null) {
             Timber.w("mFragment is null, returning");
@@ -452,7 +472,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
                 if (!hasInitializedVideoManager()) {
                     return;
                 }
-                syncPlayIntegration.getValue().onUserPlay();
+                syncPlayIntegration.getValue().onUserPlay(origin);
                 // just resume
                 mVideoManager.play();
                 mPlaybackState = PlaybackState.PLAYING; // won't get another onPrepared call
@@ -468,6 +488,8 @@ public class PlaybackController implements PlaybackControllerNotifiable {
                 // set mSeekPosition so the seekbar will not default to 0:00
                 mSeekPosition = position;
                 mCurrentPosition = 0;
+                hasPreparedCurrentStream = false;
+                pendingAutoPlayOnStart = origin == SyncPlayEventOrigin.REMOTE_SYNCPLAY || !syncPlayIntegration.getValue().shouldStartPaused();
 
                 mFragment.setFadingEnabled(false);
 
@@ -540,7 +562,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
                 if (itemIds.isEmpty() && item != null && item.getId() != null) {
                     itemIds.add(item.getId());
                 }
-                syncPlayIntegration.getValue().onUserStartPlayback(itemIds, mCurrentIndex, position * 10000L);
+                syncPlayIntegration.getValue().onUserStartPlayback(itemIds, mCurrentIndex, position * 10000L, origin);
 
                 long duration = getCurrentlyPlayingItem().getRunTimeTicks() != null ? getCurrentlyPlayingItem().getRunTimeTicks() / 10000 : -1;
                 if (mVideoManager != null)
@@ -664,18 +686,23 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             return;
         }
 
-        mCurrentOptions.setAudioStreamIndex(null); // reset audio stream index to allow auto selection on new item
+        if (!preserveAudioIndexForRebuild) {
+            mCurrentOptions.setAudioStreamIndex(null); // reset audio stream index to allow auto selection on new item
+        }
+        preserveAudioIndexForRebuild = false;
+        hasPreparedCurrentStream = false;
 
         mStartPosition = position;
+        awaitingInitialSeekForSyncPlay = position > 0;
         mCurrentStreamInfo = response;
-        mCurrentOptions.setMediaSourceId(response.getMediaSource().getId());
+        if (response.getMediaSource() != null) {
+            mCurrentOptions.setMediaSourceId(response.getMediaSource().getId());
+        }
 
         if (response.getMediaUrl() == null) {
             // If baking subtitles doesn't work (e.g. no permissions to transcode), disable them
-            if (response.getSubtitleDeliveryMethod() == SubtitleDeliveryMethod.ENCODE && (response.getMediaSource().getDefaultSubtitleStreamIndex() == null || response.getMediaSource().getDefaultSubtitleStreamIndex() != -1)) {
-                burningSubs = false;
-                stop();
-                play(position, -1);
+            if (response.getSubtitleDeliveryMethod() == SubtitleDeliveryMethod.ENCODE && response.getMediaSource() != null && (response.getMediaSource().getDefaultSubtitleStreamIndex() == null || response.getMediaSource().getDefaultSubtitleStreamIndex() != -1)) {
+                restartStreamForSubtitleChange(-1, false);
             } else {
                 handlePlaybackInfoError(null);
             }
@@ -729,6 +756,10 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             mVideoManager.setMediaStreamInfo(api.getValue(), response);
         }
 
+        final boolean startPlayWhenReady = pendingAutoPlayOnStart && !syncPlayIntegration.getValue().shouldStartPaused();
+        activeStreamShouldStartPaused = !startPlayWhenReady;
+        pendingAutoPlayOnStart = true;
+
         PlaybackControllerHelperKt.applyMediaSegments(this, item, () -> {
             // Set video start delay
             long videoStartDelay = userPreferences.getValue().get(UserPreferences.Companion.getVideoStartDelay());
@@ -737,12 +768,12 @@ public class PlaybackController implements PlaybackControllerNotifiable {
                     @Override
                     public void run() {
                         if (mVideoManager != null) {
-                            mVideoManager.start();
+                            mVideoManager.start(startPlayWhenReady);
                         }
                     }
                 }, videoStartDelay);
-            } else {
-                mVideoManager.start();
+            } else if (mVideoManager != null) {
+                mVideoManager.start(startPlayWhenReady);
             }
 
             dataRefreshService.getValue().setLastPlayedItem(item);
@@ -831,6 +862,49 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         Timber.d("default audio index set to %s", mDefaultAudioIndex);
     }
 
+    /**
+     * Rebuilds the active media stream for subtitle changes (burn-in enable/disable/switch)
+     * without emitting SyncPlay Stop/SetNewQueue events or losing paused state.
+     */
+    public void restartStreamForSubtitleChange(int subtitleIndex, boolean willBurnSubs) {
+        if (mFragment == null || getCurrentlyPlayingItem() == null) return;
+
+        boolean wasPlaying = isPlaying();
+        refreshCurrentPosition();
+        long resumePos = getCurrentPosition();
+
+        syncPlayIntegration.getValue().beginInternalTransition(
+                willBurnSubs ? PlaybackTransitionReason.BURN_IN_REBUILD : PlaybackTransitionReason.TRACK_SWITCH,
+                wasPlaying
+        );
+
+        Integer currentAudioIndex = mCurrentOptions != null ? mCurrentOptions.getAudioStreamIndex() : null;
+        VideoOptions rebuildOptions = buildExoPlayerOptions(
+                subtitleIndex,
+                videoQueueManager.getValue().getLastPlayedAudioLanguageIsoCode(),
+                getCurrentlyPlayingItem()
+        );
+        rebuildOptions.setAudioStreamIndex(currentAudioIndex);
+        rebuildOptions.setSubtitleStreamIndex(subtitleIndex);
+
+        stop();
+
+        burningSubs = willBurnSubs;
+        mCurrentOptions = rebuildOptions;
+        preserveAudioIndexForRebuild = currentAudioIndex != null;
+        pendingAutoPlayOnStart = wasPlaying && !syncPlayIntegration.getValue().shouldStartPaused();
+        mSeekPosition = resumePos;
+        mStartPosition = resumePos;
+        mCurrentPosition = resumePos;
+        mPlaybackState = PlaybackState.BUFFERING;
+        hasPreparedCurrentStream = false;
+
+        startSpinner();
+        mFragment.setFadingEnabled(false);
+        mFragment.setCurrentTime(resumePos);
+        playInternal(getCurrentlyPlayingItem(), resumePos, rebuildOptions);
+    }
+
     public void switchAudioStream(int index) {
         if (!(isPlaying() || isPaused()) || index < 0)
             return;
@@ -864,29 +938,51 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         }
 
         // get current timestamp first
+        boolean wasPlaying = isPlaying();
         refreshCurrentPosition();
+        long resumePos = getCurrentPosition();
 
         if (!isTranscoding() && mVideoManager.setExoPlayerTrack(index, MediaStreamType.AUDIO, currentMediaSource.getMediaStreams())) {
+            syncPlayIntegration.getValue().beginInternalTransition(PlaybackTransitionReason.TRACK_SWITCH, wasPlaying);
+            mHandler.removeCallbacks(endInternalTrackSwitchRunnable);
+            mHandler.postDelayed(endInternalTrackSwitchRunnable, 1200L);
             mCurrentOptions.setMediaSourceId(currentMediaSource.getId());
             mCurrentOptions.setAudioStreamIndex(index);
         } else {
+            syncPlayIntegration.getValue().beginInternalTransition(PlaybackTransitionReason.TRACK_SWITCH, wasPlaying);
             startSpinner();
             mCurrentOptions.setMediaSourceId(currentMediaSource.getId());
             mCurrentOptions.setAudioStreamIndex(index);
+            VideoOptions rebuildOptions = mCurrentOptions;
             stop();
-            playInternal(getCurrentlyPlayingItem(), mCurrentPosition, mCurrentOptions);
+            mCurrentOptions = rebuildOptions;
+            preserveAudioIndexForRebuild = true;
+            pendingAutoPlayOnStart = wasPlaying && !syncPlayIntegration.getValue().shouldStartPaused();
+            mSeekPosition = resumePos;
+            mStartPosition = resumePos;
+            mCurrentPosition = resumePos;
             mPlaybackState = PlaybackState.BUFFERING;
+            hasPreparedCurrentStream = false;
+            playInternal(getCurrentlyPlayingItem(), resumePos, rebuildOptions);
         }
     }
 
     public void pause() {
-        Timber.i("pause called at %s", mCurrentPosition);
+        pause(SyncPlayEventOrigin.USER_LOCAL);
+    }
+
+    public void pauseRemote() {
+        pause(SyncPlayEventOrigin.REMOTE_SYNCPLAY);
+    }
+
+    protected void pause(SyncPlayEventOrigin origin) {
+        Timber.i("pause called at %s (origin=%s)", mCurrentPosition, origin);
         // if playback is paused and the seekbar is scrubbed, it will call pause even if already paused
         if (mPlaybackState == PlaybackState.PAUSED) {
             Timber.d("already paused, ignoring");
             return;
         }
-        syncPlayIntegration.getValue().onUserPause();
+        syncPlayIntegration.getValue().onUserPause(origin);
         mPlaybackState = PlaybackState.PAUSED;
         if (hasInitializedVideoManager()) mVideoManager.pause();
         if (mFragment != null) {
@@ -897,7 +993,6 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         stopReportLoop();
         // start a slower report for pause state to keep session alive
         startPauseReportLoop();
-
     }
 
     public void playPause() {
@@ -938,10 +1033,18 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     }
 
     public void endPlayback(Boolean closeActivity) {
+        endPlayback(closeActivity, SyncPlayEventOrigin.USER_LOCAL);
+    }
+
+    public void stopRemote() {
+        endPlayback(true, SyncPlayEventOrigin.REMOTE_SYNCPLAY);
+    }
+
+    protected void endPlayback(Boolean closeActivity, SyncPlayEventOrigin origin) {
         if (closeActivity && mFragment != null) {
             mFragment.closePlayer();
         }
-        syncPlayIntegration.getValue().onUserStop();
+        syncPlayIntegration.getValue().onUserStop(origin);
         stop();
         if (mVideoManager != null)
             mVideoManager.destroy();
@@ -1016,22 +1119,31 @@ public class PlaybackController implements PlaybackControllerNotifiable {
     }
 
     public void seek(long pos, boolean skipToNext) {
+        seek(pos, skipToNext, true, SyncPlayEventOrigin.USER_LOCAL);
+    }
+
+    public void seekRemote(long pos, boolean autoPlay) {
+        seek(pos, false, autoPlay, SyncPlayEventOrigin.REMOTE_SYNCPLAY);
+    }
+
+    protected void seek(long pos, boolean skipToNext, boolean autoPlay, SyncPlayEventOrigin origin) {
         if (pos <= 0) pos = 0;
 
-        Timber.i("Trying to seek from %s to %d", mCurrentPosition, pos);
+        Timber.i("Trying to seek from %s to %d (autoPlay=%s, origin=%s)", mCurrentPosition, pos, autoPlay, origin);
         Timber.d("Container: %s", mCurrentStreamInfo == null ? "unknown" : mCurrentStreamInfo.getContainer());
 
         if (!hasInitializedVideoManager()) {
             return;
         }
 
-        syncPlayIntegration.getValue().onUserSeek(pos);
+        syncPlayIntegration.getValue().onUserSeek(pos, origin);
 
-        if (wasSeeking) {
+        // Do not silently drop authoritative remote SyncPlay seeks or internal initial seeks
+        if (wasSeeking && origin == SyncPlayEventOrigin.USER_LOCAL) {
             Timber.d("Previous seek has not finished - cancelling seek from %s to %d", mCurrentPosition, pos);
             if (isPaused()) {
                 refreshCurrentPosition();
-                play(mCurrentPosition);
+                play(mCurrentPosition, null, SyncPlayEventOrigin.INTERNAL_PLAYER_TRANSITION);
             }
             return;
         }
@@ -1049,12 +1161,17 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             return;
         }
 
-        if (pos >= getDuration()) pos = getDuration();
+        if (pos >= getDuration() && getDuration() > 0) pos = getDuration();
 
         // set seekPosition so real position isn't used until playback starts again
         mSeekPosition = pos;
+        mCurrentPosition = pos;
 
         if (mCurrentStreamInfo == null) return;
+
+        final boolean effectiveAutoPlay = origin == SyncPlayEventOrigin.REMOTE_SYNCPLAY || origin == SyncPlayEventOrigin.INTERNAL_PLAYER_TRANSITION
+                ? autoPlay
+                : (autoPlay && (!syncPlayIntegration.getValue().isInGroup() || isPlaying()));
 
         // rebuild the stream
         // if an older device uses exoplayer to play a transcoded stream but falls back to the generic http stream instead of hls, rebuild the stream
@@ -1069,12 +1186,13 @@ public class PlaybackController implements PlaybackControllerNotifiable {
                 public void onResponse(StreamInfo response) {
                     if (!isActive()) return;
                     mCurrentStreamInfo = response;
+                    hasPreparedCurrentStream = false;
 
                     updateBurningSubs(response);
 
                     if (mVideoManager != null) {
                         mVideoManager.setMediaStreamInfo(api.getValue(), response);
-                        mVideoManager.start();
+                        mVideoManager.start(effectiveAutoPlay);
                     }
                 }
 
@@ -1090,20 +1208,27 @@ public class PlaybackController implements PlaybackControllerNotifiable {
             });
         } else {
             // use the same approach to directplay seeking as setOnProgressListener
-            // set state to SEEKING
-            // if seek succeeds call play and mirror the logic in play() for unpausing. if fails call pause()
-            // stopProgressLoop() being called at the beginning of startProgressLoop keeps this from breaking. otherwise it would start twice
-            // if seek() is called from skip()
             mPlaybackState = PlaybackState.SEEKING;
             if (mVideoManager.seekTo(pos) < 0) {
                 if (mFragment != null)
                     Utils.showToast(mFragment.getContext(), mFragment.getString(R.string.seek_error));
-                pause();
-            } else {
+                pause(origin);
+            } else if (effectiveAutoPlay) {
                 mVideoManager.play();
                 mPlaybackState = PlaybackState.PLAYING;
                 if (mFragment != null) mFragment.setFadingEnabled(true);
                 startReportLoop();
+            } else {
+                mVideoManager.pause();
+                mPlaybackState = PlaybackState.PAUSED;
+                wasSeeking = false;
+                finishedInitialSeek = true;
+                if (mFragment != null) {
+                    mFragment.setFadingEnabled(false);
+                    mFragment.setPlayPauseActionState(0);
+                    mFragment.setCurrentTime(pos);
+                }
+                startPauseReportLoop();
             }
         }
     }
@@ -1217,7 +1342,7 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         }
     }
 
-    private void initialSeek(final long position) {
+    private void initialSeek(final long position, final boolean autoPlay) {
         mHandler.post(new Runnable() {
             @Override
             public void run() {
@@ -1228,9 +1353,11 @@ public class PlaybackController implements PlaybackControllerNotifiable {
                     // wait until we have valid duration
                     mHandler.postDelayed(this, 25);
                 } else if (mVideoManager.isSeekable()) {
-                    seek(position);
+                    seek(position, false, autoPlay, SyncPlayEventOrigin.INTERNAL_PLAYER_TRANSITION);
+                    notifySyncPlayStreamReadyIfReady();
                 } else {
                     finishedInitialSeek = true;
+                    notifySyncPlayStreamReadyIfReady();
                 }
             }
         });
@@ -1278,56 +1405,88 @@ public class PlaybackController implements PlaybackControllerNotifiable {
 
     @Override
     public void onBuffering() {
-        syncPlayIntegration.getValue().onPlayerBuffering();
+        if (hasPreparedCurrentStream && mStartPosition <= 0 && !awaitingInitialSeekForSyncPlay) {
+            syncPlayIntegration.getValue().onPlayerBuffering();
+        }
+    }
+
+    @Override
+    public void onBufferingEnded() {
+        if (awaitingInitialSeekForSyncPlay && hasPreparedCurrentStream && mStartPosition <= 0) {
+            notifySyncPlayStreamReadyIfReady();
+        } else {
+            syncPlayIntegration.getValue().onPlayerBufferingEnded();
+        }
+    }
+
+    private void notifySyncPlayStreamReadyIfReady() {
+        if (!hasPreparedCurrentStream) return;
+        awaitingInitialSeekForSyncPlay = false;
+        syncPlayIntegration.getValue().onStreamReady(getCurrentPosition(), isPlaying());
     }
 
     @Override
     public void onPrepared() {
-        if (mPlaybackState == PlaybackState.BUFFERING) {
-            if (mFragment != null) {
-                mFragment.setFadingEnabled(true);
-                mFragment.leanbackOverlayFragment.setShouldShowOverlay(false);
-            }
+        if (hasPreparedCurrentStream) {
+            // Ignore duplicate onPrepared callbacks triggered by resume/unpause/rebuffer
+            return;
+        }
+        hasPreparedCurrentStream = true;
 
-            mPlaybackState = PlaybackState.PLAYING;
-            interactionTracker.notifyStart(getCurrentlyPlayingItem());
-            mCurrentTranscodeStartTime = mCurrentStreamInfo != null && mCurrentStreamInfo.getPlayMethod() == PlayMethod.TRANSCODE ? Instant.now().toEpochMilli() : 0;
-            startReportLoop();
+        boolean shouldStartPaused = activeStreamShouldStartPaused || syncPlayIntegration.getValue().shouldStartPaused();
+        if (mPlaybackState == PlaybackState.BUFFERING) {
+            if (shouldStartPaused) {
+                mPlaybackState = PlaybackState.PAUSED;
+                if (hasInitializedVideoManager()) mVideoManager.pause();
+                if (mFragment != null) {
+                    mFragment.setFadingEnabled(false);
+                    mFragment.setPlayPauseActionState(0);
+                }
+                startPauseReportLoop();
+            } else {
+                if (mFragment != null) {
+                    mFragment.setFadingEnabled(true);
+                    mFragment.leanbackOverlayFragment.setShouldShowOverlay(false);
+                }
+                mPlaybackState = PlaybackState.PLAYING;
+                interactionTracker.notifyStart(getCurrentlyPlayingItem());
+                mCurrentTranscodeStartTime = mCurrentStreamInfo != null && mCurrentStreamInfo.getPlayMethod() == PlayMethod.TRANSCODE ? Instant.now().toEpochMilli() : 0;
+                startReportLoop();
+            }
         }
 
         Timber.i("Play method: %s", mCurrentStreamInfo != null && mCurrentStreamInfo.getPlayMethod() == PlayMethod.TRANSCODE ? "Trans" : "Direct");
 
-        if (mPlaybackState == PlaybackState.PAUSED) {
-            mPlaybackState = PlaybackState.PLAYING;
+        if (!burningSubs) {
+            // Make sure the requested subtitles are enabled when external/embedded
+            Integer currentSubtitleIndex = mCurrentOptions != null ? mCurrentOptions.getSubtitleStreamIndex() : null;
+            if (currentSubtitleIndex == null) currentSubtitleIndex = -1;
+            PlaybackControllerHelperKt.setSubtitleIndex(this, currentSubtitleIndex, true);
         } else {
-            if (!burningSubs) {
-                // Make sure the requested subtitles are enabled when external/embedded
-                Integer currentSubtitleIndex = mCurrentOptions != null ? mCurrentOptions.getSubtitleStreamIndex() : null;
-                if (currentSubtitleIndex == null) currentSubtitleIndex = -1;
-                PlaybackControllerHelperKt.setSubtitleIndex(this, currentSubtitleIndex, true);
-            } else {
-                PlaybackControllerHelperKt.disableDefaultSubtitles(this);
-            }
-
-            if (mPlaybackState == PlaybackState.IDLE || mPlaybackState == PlaybackState.BUFFERING) {
-                return;
-            }
-
-            // select an audio track
-            int eligibleAudioTrack = mDefaultAudioIndex;
-
-            // if track switching is done without rebuilding the stream, mCurrentOptions is updated
-            // otherwise, use the server default
-            MediaSourceInfo currentMediaSource = getCurrentMediaSource();
-            if (mCurrentOptions != null && mCurrentOptions.getAudioStreamIndex() != null) {
-                eligibleAudioTrack = mCurrentOptions.getAudioStreamIndex();
-            } else if (currentMediaSource != null && currentMediaSource.getDefaultAudioStreamIndex() != null) {
-                eligibleAudioTrack = currentMediaSource.getDefaultAudioStreamIndex();
-            }
-            switchAudioStream(eligibleAudioTrack);
+            PlaybackControllerHelperKt.disableDefaultSubtitles(this);
         }
 
-        syncPlayIntegration.getValue().onPlayerPrepared();
+        // select an audio track
+        int eligibleAudioTrack = mDefaultAudioIndex;
+
+        // if track switching is done without rebuilding the stream, mCurrentOptions is updated
+        // otherwise, use the server default
+        MediaSourceInfo currentMediaSource = getCurrentMediaSource();
+        if (mCurrentOptions != null && mCurrentOptions.getAudioStreamIndex() != null) {
+            eligibleAudioTrack = mCurrentOptions.getAudioStreamIndex();
+        } else if (currentMediaSource != null && currentMediaSource.getDefaultAudioStreamIndex() != null) {
+            eligibleAudioTrack = currentMediaSource.getDefaultAudioStreamIndex();
+        }
+        switchAudioStream(eligibleAudioTrack);
+
+        if (mStartPosition > 0) {
+            long seekPos = mStartPosition;
+            mStartPosition = 0;
+            awaitingInitialSeekForSyncPlay = true;
+            initialSeek(seekPos, !shouldStartPaused);
+        } else {
+            notifySyncPlayStreamReadyIfReady();
+        }
     }
 
     @Override
@@ -1359,11 +1518,16 @@ public class PlaybackController implements PlaybackControllerNotifiable {
         if (isPlaying()) {
             if (!spinnerOff) {
                 if (mStartPosition > 0) {
-                    initialSeek(mStartPosition);
+                    long seekPos = mStartPosition;
                     mStartPosition = 0;
+                    awaitingInitialSeekForSyncPlay = true;
+                    initialSeek(seekPos, true);
                 } else {
                     finishedInitialSeek = true;
                     stopSpinner();
+                    if (awaitingInitialSeekForSyncPlay) {
+                        notifySyncPlayStreamReadyIfReady();
+                    }
                 }
             }
         }
