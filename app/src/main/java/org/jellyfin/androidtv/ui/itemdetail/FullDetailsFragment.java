@@ -152,10 +152,29 @@ public class FullDetailsFragment extends Fragment implements RecordingIndicatorV
     final Lazy<PlaybackHelper> playbackHelper = inject(PlaybackHelper.class);
     private final Lazy<ImageHelper> imageHelper = inject(ImageHelper.class);
     private final Lazy<InteractionTrackerViewModel> interactionTracker = inject(InteractionTrackerViewModel.class);
+    private boolean useComposeDetail = false;
 
     @Nullable
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
+        Bundle args = getArguments();
+        mItemId = args != null ? Utils.uuidOrNull(args.getString("ItemId")) : null;
+        mChannelId = args != null ? Utils.uuidOrNull(args.getString("ChannelId")) : null;
+        String programJson = args != null ? args.getString("ProgramInfo") : null;
+        if (programJson != null) {
+            mProgramInfo = Json.Default.decodeFromString(BaseItemDto.Companion.serializer(), programJson);
+        }
+        String timerJson = args != null ? args.getString("SeriesTimer") : null;
+        if (timerJson != null) {
+            mSeriesTimerInfo = Json.Default.decodeFromString(SeriesTimerInfoDto.Companion.serializer(), timerJson);
+        }
+
+        if (mChannelId == null && programJson == null && timerJson == null && mItemId != null) {
+            useComposeDetail = true;
+            return MediaDetailScreenKt.createMediaDetailComposeView(requireContext(), mItemId);
+        }
+        useComposeDetail = false;
+
         FragmentFullDetailsBinding binding = FragmentFullDetailsBinding.inflate(getLayoutInflater(), container, false);
 
         BUTTON_SIZE = Utils.convertDpToPixel(requireContext(), 40);
@@ -170,17 +189,6 @@ public class FullDetailsFragment extends Fragment implements RecordingIndicatorV
         mRowsFragment.setOnItemViewSelectedListener(new ItemViewSelectedListener());
 
         mDorPresenter = new MyDetailsOverviewRowPresenter(markdownRenderer.getValue());
-
-        mItemId = Utils.uuidOrNull(getArguments().getString("ItemId"));
-        mChannelId = Utils.uuidOrNull(getArguments().getString("ChannelId"));
-        String programJson = getArguments().getString("ProgramInfo");
-        if (programJson != null) {
-            mProgramInfo = Json.Default.decodeFromString(BaseItemDto.Companion.serializer(), programJson);
-        }
-        String timerJson = getArguments().getString("SeriesTimer");
-        if (timerJson != null) {
-            mSeriesTimerInfo = Json.Default.decodeFromString(SeriesTimerInfoDto.Companion.serializer(), timerJson);
-        }
 
         CoroutineUtils.readCustomMessagesOnLifecycle(getLifecycle(), customMessageRepository.getValue(), message -> {
             if (message.equals(CustomMessage.ActionComplete.INSTANCE) && mSeriesTimerInfo != null) {
@@ -226,6 +234,7 @@ public class FullDetailsFragment extends Fragment implements RecordingIndicatorV
     @Override
     public void onResume() {
         super.onResume();
+        if (useComposeDetail) return;
 
         ClockBehavior clockBehavior = userPreferences.getValue().get(UserPreferences.Companion.getClockBehavior());
         if (clockBehavior == ClockBehavior.ALWAYS || clockBehavior == ClockBehavior.IN_MENUS) {
@@ -281,17 +290,20 @@ public class FullDetailsFragment extends Fragment implements RecordingIndicatorV
     @Override
     public void onPause() {
         super.onPause();
+        if (useComposeDetail) return;
         stopClock();
     }
 
     @Override
     public void onStop() {
         super.onStop();
+        if (useComposeDetail) return;
         stopClock();
     }
 
     @Override
     public boolean onKey(View v, int keyCode, KeyEvent event) {
+        if (useComposeDetail) return false;
         if (event.getAction() != KeyEvent.ACTION_UP) return false;
 
         if (mCurrentItem != null) {

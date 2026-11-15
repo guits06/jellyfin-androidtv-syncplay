@@ -4,6 +4,7 @@ import static org.koin.java.KoinJavaComponent.inject;
 
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.media.AudioManager;
 import android.os.AsyncTask;
@@ -78,6 +79,7 @@ import org.jellyfin.sdk.model.api.BaseItemDto;
 import org.jellyfin.sdk.model.api.BaseItemKind;
 import org.jellyfin.sdk.model.api.ChapterInfo;
 import org.jellyfin.sdk.model.api.GroupInfoDto;
+import org.jellyfin.sdk.model.api.GroupStateType;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -307,17 +309,42 @@ public class CustomPlaybackOverlayFragment extends Fragment implements LiveTvGui
 
         // SyncPlay indicator
         CoroutineUtils.observeFlowOnLifecycle(getViewLifecycleOwner().getLifecycle(), syncPlayManager.getValue().getCurrentGroup(), group -> {
-            updateSyncPlayIndicator(group);
+            updateSyncPlayIndicator(group, syncPlayManager.getValue().getGroupState().getValue());
+            return null;
+        });
+        CoroutineUtils.observeFlowOnLifecycle(getViewLifecycleOwner().getLifecycle(), syncPlayManager.getValue().getGroupState(), state -> {
+            updateSyncPlayIndicator(syncPlayManager.getValue().getCurrentGroup().getValue(), state);
             return null;
         });
     }
 
-    private void updateSyncPlayIndicator(@Nullable GroupInfoDto group) {
+    private void updateSyncPlayIndicator(@Nullable GroupInfoDto group, @NonNull GroupStateType state) {
         if (binding == null || binding.syncplayIndicator == null) return;
         if (group != null) {
             int participants = group.getParticipants() != null ? group.getParticipants().size() : 1;
-            String text = getString(R.string.syncplay_indicator_format, group.getGroupName(), participants);
-            binding.syncplayIndicator.setText(text);
+            int stateRes;
+            int tintColor;
+            switch (state) {
+                case PLAYING:
+                    stateRes = R.string.syncplay_state_playing;
+                    tintColor = 0xE62E7D32;
+                    break;
+                case WAITING:
+                    stateRes = R.string.syncplay_state_waiting;
+                    tintColor = 0xE6EF6C00;
+                    break;
+                case PAUSED:
+                    stateRes = R.string.syncplay_state_paused;
+                    tintColor = 0xE6455A64;
+                    break;
+                default:
+                    stateRes = R.string.syncplay_state_idle;
+                    tintColor = 0xE637474F;
+                    break;
+            }
+            String baseText = getString(R.string.syncplay_indicator_format, group.getGroupName(), participants);
+            binding.syncplayIndicator.setText(baseText + " • " + getString(stateRes));
+            binding.syncplayIndicator.setBackgroundTintList(ColorStateList.valueOf(tintColor));
             binding.syncplayIndicator.setVisibility(View.VISIBLE);
         } else {
             binding.syncplayIndicator.setVisibility(View.GONE);

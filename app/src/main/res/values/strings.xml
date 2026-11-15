@@ -741,6 +741,7 @@
     <string name="search_filter_episodes">Episodes</string>
     <string name="search_filter_people">People</string>
     <string name="search_no_results">No matching results</string>
+    <string name="lbl_subtitles">Subtitles</string>
     <string name="lbl_subtitles_off">Off</string>
     <string name="lbl_episode_label">E%1$d</string>
     <string name="syncplay_state_playing">Playing</string>
@@ -753,4 +754,6 @@
     <string name="action_watch_syncplay">Watch in SyncPlay</string>
     <string name="lbl_synopsis">Synopsis</string>
     <string name="lbl_shuffle_short">Shuffle</string>
+    <string name="lbl_filmography">Filmography</string>
+    <string name="search_filter_music">Music</string>
 </resources>

@@ -752,6 +752,7 @@
     <string name="search_filter_episodes">Episodios</string>
     <string name="search_filter_people">Personas</string>
     <string name="search_no_results">Sin resultados</string>
+    <string name="lbl_subtitles">Subtítulos</string>
     <string name="lbl_subtitles_off">Desactivados</string>
     <string name="lbl_episode_label">E%1$d</string>
     <string name="syncplay_state_playing">Reproduciendo</string>
@@ -764,4 +765,6 @@
     <string name="action_watch_syncplay">Ver en SyncPlay</string>
     <string name="lbl_synopsis">Sinopsis</string>
     <string name="lbl_shuffle_short">Aleatorio</string>
+    <string name="lbl_filmography">Filmografía</string>
+    <string name="search_filter_music">Música</string>
 </resources>
